@@ -407,6 +407,11 @@ const PlanEditor: React.FC<Props & { month: string; onBack: () => void }> = ({
 
 /* ====================== طلب الإجازة ====================== */
 
+interface LeaveRange { key: number; from: string; to: string }
+let rangeSeq = 0;
+const nextDay = (iso: string) =>
+  new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10) + 1)).toISOString().slice(0, 10);
+
 const LeaveForm: React.FC<Props & { editId?: string; onBack: () => void }> = ({
   user, jobs, holidays, syncUrl, requests, reload, logAction, editId, onBack
 }) => {
@@ -414,38 +419,65 @@ const LeaveForm: React.FC<Props & { editId?: string; onBack: () => void }> = ({
   const editing = editId ? requests.find(r => r.id === editId) : undefined;
   const base = editing ? asLeave(editing.status === 'approved' || editing.status === 'modified' ? editing.approvedItems : editing.items) : null;
 
-  const [from, setFrom] = useState(base?.from || today);
-  const [to, setTo] = useState(base?.to || today);
+  // فترة أو أكثر (حتى ٦) في نفس الطلب — الخادم ينشئ طلباً مستقلاً لكل فترة.
+  // التعديل لفترة واحدة فقط (الطلب القائم).
+  const [ranges, setRanges] = useState<LeaveRange[]>(() => [{ key: ++rangeSeq, from: base?.from || today, to: base?.to || today }]);
+  const setRange = (key: number, patch: Partial<LeaveRange>) =>
+    setRanges(p => p.map(r => {
+      if (r.key !== key) return r;
+      const n = { ...r, ...patch };
+      if (patch.from && n.to < patch.from) n.to = patch.from;
+      return n;
+    }));
+  const addRange = () => setRanges(p => {
+    const last = p[p.length - 1];
+    const start = last && last.to >= today ? nextDay(last.to) : today;
+    return [...p, { key: ++rangeSeq, from: start, to: start }];
+  });
   const [leaveType, setLeaveType] = useState(base?.leaveType || LEAVE_TYPES[0]);
   const [reason, setReason] = useState(base?.reason || '');
   const [sending, setSending] = useState(false);
   const [msg, setMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
   const workingDays = workingDaysFor(jobs, user.jobTitle);
-  const validRange = from && to && to >= from;
-  let workCount = 0;
-  if (validRange && daysBetween(from, to) <= 60) {
-    for (let d = from; d <= to; d = new Date(Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10) + 1)).toISOString().slice(0, 10)) {
-      if (isWorkingDay(d, workingDays, holidays)) workCount++;
-    }
-  }
+  const workCountOf = (from: string, to: string) => {
+    let n = 0;
+    if (!from || !to || to < from || daysBetween(from, to) > 60) return 0;
+    for (let d = from; d <= to; d = nextDay(d)) if (isWorkingDay(d, workingDays, holidays)) n++;
+    return n;
+  };
 
   const submit = async () => {
     setMsg(null);
-    if (!from || !to) return setMsg({ type: 'error', text: 'حدّد تاريخ البداية والنهاية.' });
-    if (from < today) return setMsg({ type: 'error', text: 'لا يمكن طلب إجازة تبدأ في يوم منقضٍ.' });
-    if (to < from) return setMsg({ type: 'error', text: 'تاريخ النهاية قبل تاريخ البداية.' });
-    if (daysBetween(from, to) > 60) return setMsg({ type: 'error', text: 'الحد الأقصى للطلب الواحد ٦٠ يوماً.' });
+    const many = ranges.length > 1;
+    for (let i = 0; i < ranges.length; i++) {
+      const { from, to } = ranges[i];
+      const lbl = many ? ` (الفترة ${i + 1})` : '';
+      if (!from || !to) return setMsg({ type: 'error', text: 'حدّد تاريخ البداية والنهاية' + lbl + '.' });
+      if (from < today) return setMsg({ type: 'error', text: 'لا يمكن طلب إجازة تبدأ في يوم منقضٍ' + lbl + '.' });
+      if (to < from) return setMsg({ type: 'error', text: 'تاريخ النهاية قبل تاريخ البداية' + lbl + '.' });
+      if (daysBetween(from, to) > 60) return setMsg({ type: 'error', text: 'الحد الأقصى للفترة الواحدة ٦٠ يوماً' + lbl + '.' });
+    }
+    const sorted = [...ranges].sort((a, b) => (a.from < b.from ? -1 : 1));
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].from <= sorted[i - 1].to) return setMsg({ type: 'error', text: 'الفترات متداخلة — راجع التواريخ.' });
+    }
 
     setSending(true);
     const res = await postRequestAction(syncUrl, {
       action: 'submitLeaveRequest', ...employeeAuth(user.nationalId),
-      requestId: editing?.id, from, to, leaveType, reason: reason.trim()
+      requestId: editing?.id,
+      ranges: sorted.map(r => ({ from: r.from, to: r.to })),
+      from: sorted[0].from, to: sorted[0].to, // للخادم القديم قبل دعم أكثر من فترة
+      leaveType, reason: reason.trim()
     });
     setSending(false);
     if (!res.ok) { setMsg({ type: 'error', text: res.error || 'تعذّر الإرسال' }); return; }
-    logAction(editing ? 'تعديل طلب إجازة' : 'طلب إجازة', `${leaveType} | من ${from} إلى ${to}`);
-    setMsg({ type: 'success', text: 'أُرسل الطلب إلى المدير، وهو الآن بانتظار الموافقة.' });
+    logAction(editing ? 'تعديل طلب إجازة' : 'طلب إجازة',
+      `${leaveType} | ${sorted.map(r => `من ${r.from} إلى ${r.to}`).join(' ، ')}`);
+    setMsg({ type: 'success', text: many
+      ? `أُرسلت ${sorted.length === 2 ? 'الفترتان' : sorted.length + ' فترات'} إلى المدير (طلب لكل فترة)، وهي بانتظار الموافقة.`
+      : 'أُرسل الطلب إلى المدير، وهو الآن بانتظار الموافقة.' });
     await reload();
   };
 
@@ -461,21 +493,42 @@ const LeaveForm: React.FC<Props & { editId?: string; onBack: () => void }> = ({
         </div>
         {editing && <DecisionNote r={editing} />}
 
-        <div className="grid grid-cols-2 gap-3">
-          <label className="space-y-1.5">
-            <span className="text-xs font-bold text-slate-400">من</span>
-            <input type="date" value={from} min={today} onChange={e => { setFrom(e.target.value); if (to < e.target.value) setTo(e.target.value); }}
-              className={field} style={{ direction: 'ltr', textAlign: 'right' }} />
-          </label>
-          <label className="space-y-1.5">
-            <span className="text-xs font-bold text-slate-400">إلى</span>
-            <input type="date" value={to} min={from || today} onChange={e => setTo(e.target.value)}
-              className={field} style={{ direction: 'ltr', textAlign: 'right' }} />
-          </label>
+        <div className="space-y-3">
+          {ranges.map((r, i) => (
+            <div key={r.key} className={ranges.length > 1 ? 'p-3 rounded-2xl border border-slate-700 bg-slate-900/50 space-y-2' : 'space-y-2'}>
+              {ranges.length > 1 && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black text-amber-300">الفترة {i + 1}</span>
+                  <button type="button" onClick={() => setRanges(p => p.filter(x => x.key !== r.key))}
+                    className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-400 hover:text-red-400" aria-label="حذف الفترة">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <label className="space-y-1.5">
+                  <span className="text-xs font-bold text-slate-400">من</span>
+                  <input type="date" value={r.from} min={today} onChange={e => setRange(r.key, { from: e.target.value })}
+                    className={field} style={{ direction: 'ltr', textAlign: 'right' }} />
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-xs font-bold text-slate-400">إلى</span>
+                  <input type="date" value={r.to} min={r.from || today} onChange={e => setRange(r.key, { to: e.target.value })}
+                    className={field} style={{ direction: 'ltr', textAlign: 'right' }} />
+                </label>
+              </div>
+              {r.from && r.to && r.to >= r.from && (
+                <div className="text-xs text-slate-400">{dayCount(daysBetween(r.from, r.to))}، منها {workCountOf(r.from, r.to)} من أيام العمل</div>
+              )}
+            </div>
+          ))}
+          {!editing && ranges.length < 6 && (
+            <button type="button" onClick={addRange}
+              className="w-full min-h-[44px] rounded-2xl border border-dashed border-slate-600 text-sm font-black text-slate-300 hover:text-white hover:border-amber-400 flex items-center justify-center gap-2">
+              <Plus size={16} /> إضافة فترة أخرى
+            </button>
+          )}
         </div>
-        {validRange && (
-          <div className="text-xs text-slate-400">{dayCount(daysBetween(from, to))}، منها {workCount} من أيام العمل</div>
-        )}
 
         <div className="space-y-1.5">
           <span className="text-xs font-bold text-slate-400">نوع الإجازة</span>

@@ -52,6 +52,7 @@ export interface ReportAccount {
   password?: string;
   allowedJobs: string[];
   allowedEmployees?: string[]; // New: Allow specific employees access
+  telegram?: boolean;           // صلاحية رسائل تليجرام لطلبات موظفيه
 }
 
 export interface AttendanceRecord {

@@ -7,6 +7,7 @@ import { LazyRequestsAdmin, ScreenLoader } from './LazyScreens';
 import { postRequestAction } from './requestsApi';
 import { getSavedLogin, setSavedLogin, clearSavedLogin } from '../utils';
 import { setSessionApprover } from './desktopNotify';
+import TelegramLink from './TelegramLink';
 import { Inbox, ChevronDown as ReqChevron } from 'lucide-react';
 
 interface ReportsViewProps {
@@ -1025,6 +1026,10 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         </div>
       </div>
       
+      {!autoLoginAdmin && (
+        <TelegramLink syncUrl={activeSyncUrl} approverUser={username} approverPass={password} />
+      )}
+
       {!autoLoginAdmin && (
         <div className="bg-slate-800 rounded-3xl border border-slate-700 shadow-lg">
           <button type="button" onClick={() => setShowRequests(v => !v)}

@@ -6,6 +6,7 @@ import * as XLSX from 'xlsx';
 import ReportsView from './ReportsView';
 import { LazyRequestsAdmin, ScreenLoader } from './LazyScreens';
 import { postRequestAction } from './requestsApi';
+import TelegramLink from './TelegramLink';
 import { Inbox } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -1171,6 +1172,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <th className="py-4 px-2">كلمة المرور</th>
                     <th className="py-4 px-2">الوظائف المسموح بها</th>
                     <th className="py-4 px-2">الموظفين المسموح بهم</th>
+                    <th className="py-4 px-2 text-center">رسائل تليجرام</th>
                     <th className="py-4 px-2 text-center">إجراءات</th>
                   </tr>
                 </thead>
@@ -1250,6 +1252,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </div>
                         )}
                       </td>
+                      <td data-label="رسائل تليجرام" className="py-4 px-2 text-center">
+                        <button type="button"
+                          onClick={() => {
+                            const on = !acc.telegram;
+                            saveReportAccounts(prev => prev.map(x => x.id === acc.id ? { ...x, telegram: on } : x));
+                            logAction(on ? 'تفعيل رسائل تليجرام' : 'إيقاف رسائل تليجرام', `الحساب: ${acc.username}`);
+                          }}
+                          className={`min-h-[36px] px-3 rounded-lg text-[11px] font-black border transition-all ${acc.telegram ? 'bg-sky-600 text-white border-sky-500' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-slate-200'}`}
+                          title={acc.telegram ? 'تصله رسائل طلبات موظفيه — اضغط للإيقاف' : 'اضغط للسماح له بربط تليجرام'}>
+                          {acc.telegram ? 'مفعّلة' : 'غير مفعّلة'}
+                        </button>
+                      </td>
                       <td data-label="إجراءات" className="py-4 px-2 text-center">
                         <div className="flex justify-center gap-2">
                           {editingReportId === acc.id ? (
@@ -1296,6 +1310,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
         )}
         {activeTab === 'requests' && (
           <ScreenLoader>
+            <div className="mb-4">
+              <TelegramLink syncUrl={config.syncUrl} approverUser={config.adminUsername} approverPass={config.adminPassword || ''} />
+            </div>
             <LazyRequestsAdmin
               syncUrl={config.syncUrl} approverUser={config.adminUsername} approverPass={config.adminPassword || ''}
               branches={branches} onPendingCount={setPendingRequests} onChanged={onRefresh} logAction={logAction}

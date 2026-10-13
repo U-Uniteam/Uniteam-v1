@@ -58,6 +58,8 @@ const notify = (title: string, body: string) => desktopInvoke('notify', { title,
 const setBadge = (count: number) => desktopInvoke('set_badge', { count: Math.max(0, Math.floor(count)) });
 
 let runNow: (() => void) | null = null;
+// العلامة يملكها فحص المدير فقط إن وضعها هو — حتى لا يمسح علامة قرارات الموظف على نفس الجهاز
+let managerOwnsBadge = false;
 
 /** فحص فوري خارج الموعد — بعد موافقة المدير أو رفضه، لتختفي العلامة دون انتظار */
 export const refreshDesktopNotifier = (): void => { if (runNow) runNow(); };
@@ -75,7 +77,10 @@ export function startDesktopNotifier(getSyncUrl: () => string): () => void {
     try {
       const url = getSyncUrl();
       const creds = credentials();
-      if (!url || creds.length === 0) { await setBadge(0); return; }
+      if (!url || creds.length === 0) {
+        if (managerOwnsBadge) { managerOwnsBadge = false; await setBadge(0); }
+        return;
+      }
       if (!navigator.onLine) return;
 
       const all = new Map<string, StaffRequest>();
@@ -95,6 +100,7 @@ export function startDesktopNotifier(getSyncUrl: () => string): () => void {
       writeSeen(next);
 
       const pending = Array.from(all.values()).filter(r => r.status === 'pending');
+      managerOwnsBadge = true;
       await setBadge(pending.length);
 
       // أول تشغيل على هذا الجهاز: ملخّص واحد بدل سيل إشعارات قديمة
@@ -130,3 +136,49 @@ export function startDesktopNotifier(getSyncUrl: () => string): () => void {
   runNow = () => { void tick(); };
   return () => { stopped = true; runNow = null; clearTimeout(first); clearInterval(timer); };
 }
+
+// ---------------- قرارات المدير للموظف (تطبيق ويندوز) ----------------
+
+const DECISION_LABEL: Record<string, string> = {
+  approved: '✅ وافق المدير على',
+  modified: '✏️ وافق المدير مع تعديل على',
+  rejected: '❌ رفض المدير',
+};
+
+/**
+ * يُستدعى من شاشة الموظف بعد كل فحص لطلباته. يُظهر إشعار ويندوز لكل قرار جديد
+ * (موافقة · موافقة مع تعديل · رفض) ويضع العلامة الحمراء بعدد القرارات غير المقروءة.
+ * أول تشغيل على الجهاز يُسجّل القرارات الموجودة دون سيل إشعارات قديمة.
+ */
+export async function notifyEmployeeDecisions(userId: string, requests: StaffRequest[], unseen: number): Promise<void> {
+  if (!isDesktopApp()) return;
+  const key = 'uniteam_notified_decisions_' + userId;
+  let seen: Record<string, string> | null = null;
+  try { const raw = localStorage.getItem(key); seen = raw ? JSON.parse(raw) : null; } catch (e) { seen = null; }
+
+  const decided = requests.filter(r => r.decidedAt && r.decidedBy !== 'الموظف' && DECISION_LABEL[r.status]);
+  const next: Record<string, string> = {};
+  decided.forEach(r => { next[r.id] = r.decidedAt || ''; });
+  try { localStorage.setItem(key, JSON.stringify(next)); } catch (e) { /* التخزين محجوب */ }
+
+  await setBadge(unseen);
+  if (!seen) return;
+
+  const fresh = decided.filter(r => seen![r.id] !== r.decidedAt);
+  if (fresh.length > 3) {
+    await notify('Uniteam — قرارات جديدة', `وصلت ${fresh.length} قرارات جديدة على طلباتك. افتح «طلباتي».`);
+    return;
+  }
+  for (const r of fresh) {
+    const what = r.type === 'plan' ? `خطة شهر ${r.month}` : (() => {
+      const l = (r.approvedItems || r.items || {}) as LeaveDetails;
+      return `إجازتك من ${l.from || '—'} إلى ${l.to || '—'}`;
+    })();
+    const verb = DECISION_LABEL[r.status];
+    const title = `${verb} ${r.type === 'plan' ? 'خطتك' : 'إجازتك'}`;
+    await notify(title, `${what}${r.managerNote ? '\nملاحظة المدير: ' + r.managerNote : ''}`);
+  }
+}
+
+/** إخفاء العلامة عند قراءة الموظف لطلباته */
+export const clearDesktopBadge = (): void => { void setBadge(0); };

@@ -158,6 +158,27 @@ const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl
   useEffect(() => { setRows(initialRows()); setLvFrom(leave?.from || ''); setLvTo(leave?.to || ''); setNote(''); setErr(''); }, [r.submittedAt, r.decidedAt, r.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pastDays = plan.filter(d => d.date < today);
+
+  // تعديل من الموظف على خطة معتمدة: مقارنة ما أرسله الآن بالمعتمد، يوماً بيوم (من اليوم فصاعداً)
+  const planDiff = useMemo(() => {
+    if (r.type !== 'plan' || r.status !== 'pending' || !r.approvedItems) return null;
+    const before: Record<string, { branchId: string; branchName?: string; reason?: string }> = {};
+    asPlan(r.approvedItems).forEach(d => { if (d.date >= today) before[d.date] = d; });
+    const after: Record<string, boolean> = {};
+    const changed: Record<string, string> = {};
+    const added: Record<string, boolean> = {};
+    sentPlan.forEach(d => {
+      if (d.date < today) return;
+      after[d.date] = true;
+      const b = before[d.date];
+      if (!b) added[d.date] = true;
+      else if (b.branchId !== d.branchId || (b.reason || '') !== (d.reason || '')) {
+        changed[d.date] = (b.branchName || b.branchId) + (b.reason ? ` («${b.reason}»)` : '');
+      }
+    });
+    const removed = Object.keys(before).filter(d => !after[d]).sort().map(d => ({ date: d, ...before[d] }));
+    return { changed, added, removed, count: Object.keys(changed).length + Object.keys(added).length + removed.length };
+  }, [r]); // eslint-disable-line react-hooks/exhaustive-deps
   // «موافقة بالتعديل» حين يختلف ما على الشاشة عمّا أرسله الموظف
   const edited = useMemo(() => {
     if (r.type === 'plan') {
@@ -246,9 +267,31 @@ const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl
                   ))}
                 </div>
               )}
+              {planDiff && (
+                <div className="p-3 rounded-xl bg-slate-800/70 border border-slate-700 space-y-2">
+                  <div className="text-xs font-black text-white">
+                    {planDiff.count === 0 ? 'أعاد الموظف الإرسال بلا تغيير عن الخطة المعتمدة.' : `التغييرات عن الخطة المعتمدة: ${planDiff.count}`}
+                  </div>
+                  {planDiff.count > 0 && (
+                    <div className="flex flex-wrap gap-3 text-[11px] font-bold text-slate-300">
+                      <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm border-2 border-amber-400" /> فرع تغيّر</span>
+                      <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm border-2 border-emerald-400" /> يوم جديد</span>
+                      <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm border-2 border-red-400" /> يوم محذوف</span>
+                    </div>
+                  )}
+                  {planDiff.removed.map(d => (
+                    <div key={d.date} className="flex justify-between items-center px-3 min-h-[36px] rounded-lg border border-red-500/60 bg-red-500/5 text-xs text-red-300">
+                      <span className="line-through">{formatDay(d.date)}</span>
+                      <span><span className="line-through">{d.branchName || d.branchId}</span> · محذوف</span>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="space-y-2">
-                {rows.map(x => (
-                  <div key={x.key} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 items-center">
+                {rows.map(x => {
+                  const mark = planDiff ? (planDiff.changed[x.date] !== undefined ? 'changed' : planDiff.added[x.date] ? 'added' : '') : '';
+                  return (
+                  <div key={x.key} className={`grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 items-center ${mark ? 'p-2 rounded-xl border-2 ' + (mark === 'changed' ? 'border-amber-400/80 bg-amber-500/5' : 'border-emerald-400/80 bg-emerald-500/5') : ''}`}>
                     <input type="date" value={x.date} min={monthStart} max={monthEnd}
                       onChange={e => setRows(p => p.map(y => (y.key === x.key ? { ...y, date: e.target.value } : y)))}
                       className={field} style={{ direction: 'ltr', textAlign: 'right' }} />
@@ -266,8 +309,14 @@ const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl
                         onChange={e => setRows(p => p.map(y => (y.key === x.key ? { ...y, reason: e.target.value } : y)))}
                         className={field + ' sm:col-span-3 text-amber-200'} aria-label="سبب اختيار Out Door" />
                     )}
+                    {mark && (
+                      <div className={`sm:col-span-3 text-[11px] font-bold ${mark === 'changed' ? 'text-amber-300' : 'text-emerald-300'}`}>
+                        {mark === 'changed' ? `كان: ${planDiff!.changed[x.date]}` : 'يوم جديد لم يكن في الخطة المعتمدة'}
+                      </div>
+                    )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
               <button type="button" onClick={() => setRows(p => [...p, { key: `a${++seq}`, date: '', branchId: '' }])}
                 className="ut-btn ut-btn--glass" style={{ minHeight: 40 }}><Plus size={15} /> إضافة يوم</button>

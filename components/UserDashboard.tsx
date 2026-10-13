@@ -4,6 +4,7 @@ import { User, Branch, AttendanceRecord, VisitPlan, Job, StaffRequest } from '..
 import { MapPin, Clock, CheckCircle, AlertCircle, RotateCcw, RefreshCw, Cloud, FileText, Navigation, Calendar, Inbox, Fingerprint } from 'lucide-react';
 import { LazyRequestsPanel, ScreenLoader } from './LazyScreens';
 import { postRequestAction, employeeAuth, unseenDecisions } from './requestsApi';
+import { notifyEmployeeDecisions, clearDesktopBadge } from './desktopNotify';
 import { calculateDistance, getDeviceFingerprint, getEgyptTime, getRealNetworkTime, checkDeveloperOptionsStatus, checkMockLocationStatus } from '../utils';
 
 interface UserDashboardProps {
@@ -71,8 +72,28 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     if (!res.ok) { setReqError(res.error || 'تعذّر تحميل الطلبات'); return; }
     const list = res.requests || [];
     setMyRequests(list);
-    setUnseen(unseenDecisions(user.id, list));
+    const n = unseenDecisions(user.id, list);
+    setUnseen(n);
+    void notifyEmployeeDecisions(user.id, list, n);
   };
+
+  // فحص صامت كل دقيقتين ما دام التطبيق مفتوحاً: يظهر الرقم الأحمر على «طلباتي» فور قرار المدير
+  // (وإشعار ويندوز في تطبيق الويندوز) دون إعادة فتح التطبيق. لا مؤشر تحميل ولا رسالة خطأ.
+  const silentCheckRef = useRef<() => void>(() => {});
+  silentCheckRef.current = async () => {
+    if (!googleSheetLink || !navigator.onLine) return;
+    const res = await postRequestAction(googleSheetLink, { action: 'getMyRequests', ...employeeAuth(user.nationalId) });
+    if (!res.ok) return;
+    const list = res.requests || [];
+    setMyRequests(list);
+    const n = unseenDecisions(user.id, list);
+    setUnseen(n);
+    void notifyEmployeeDecisions(user.id, list, n);
+  };
+  useEffect(() => {
+    const t = setInterval(() => silentCheckRef.current(), 2 * 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // جلب واحد متأخر عند الفتح لشارة التبويب — بعد مزامنة البداية لا معها
   useEffect(() => {
@@ -794,7 +815,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
           <LazyRequestsPanel
             user={user} branches={branches} jobs={jobs} holidays={holidays} syncUrl={googleSheetLink}
             requests={myRequests} loading={reqLoading} error={reqError} reload={loadRequests}
-            onSeen={() => setUnseen(0)} logAction={logAction}
+            onSeen={() => { setUnseen(0); clearDesktopBadge(); }} logAction={logAction}
           />
         </ScreenLoader>
       </div>
