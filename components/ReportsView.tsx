@@ -8,6 +8,7 @@ import { postRequestAction } from './requestsApi';
 import { getSavedLogin, setSavedLogin, clearSavedLogin } from '../utils';
 import { setSessionApprover } from './desktopNotify';
 import TelegramLink from './TelegramLink';
+import { computeCommitment, DayDetail } from './commitment';
 import { Inbox, ChevronDown as ReqChevron } from 'lucide-react';
 
 interface ReportsViewProps {
@@ -354,6 +355,9 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
    *
    * @param silent إن كانت true فلا تُظهر تنبيهاً عند غياب التاريخ (للعرض التلقائي)
    */
+  // تفاصيل كل موظف من آخر buildSummary (بنفس ترتيب الصفوف) — يقرؤها تقرير الالتزام
+  const summaryRawRef = useRef<any[]>([]);
+
   const buildSummary = (silent = false): any[] | null => {
     if (!fromDate || !toDate) { if (!silent) alert('يرجى تحديد الفترة (من تاريخ / إلى تاريخ) لحساب الملخص'); return null; }
     
@@ -439,6 +443,11 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
       const workingDays = userJob?.workingDays || [0, 1, 2, 3, 4, 6]; // Default all except Friday
       let userWorkingDaysCount = 0;
       const userWorkingDaysSet = new Set<string>();
+      const userPlanByDate: Record<string, string[]> = {};
+      // وظيفة ثابتة (لا تنقل بين الفروع): فرعها الافتراضي هو خطتها في تقرير الالتزام،
+      // إلا في يوم له خطة صريحة من المسؤول
+      const isFixedJob = !(userJob && userJob.canVisitMultipleBranches);
+      const defaultBranchKey = (getBranchName(u.defaultBranch, u) || '').toString().trim().toLowerCase();
 
       const [y, mo, d] = fromDate.split('-');
       const currentDay = new Date(parseInt(y), parseInt(mo)-1, parseInt(d));
@@ -453,8 +462,8 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         const isWorkingDay = workingDays.includes(dayOfWeek);
         const isHoliday = fetchedHolidays.includes(dateStr);
         
-        // Check if there's a "Holiday" visit plan for this user and date
-        const userPlan = visitPlans.find(p => {
+        // كل خطط هذا اليوم لهذا الموظف (الإجازة Holiday تُستبعد من أيام العمل، والباقي لحساب الالتزام بالخطة)
+        const dayPlans = visitPlans.filter(p => {
           if (!p.date) return false;
           
           // 1. Strict Date Matching (Normalize both to YYYY-MM-DD)
@@ -494,12 +503,17 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                              (isValid(uSerial) && isValid(pUser) && pUser.includes(uSerial)) ||
                              (isValid(uName) && isValid(pName) && (pName.includes(uName) || uName.includes(pName)));
 
-          return matchesUser && p.branchName === 'Holiday';
+          return matchesUser;
         });
+        const userPlan = dayPlans.find(p => p.branchName === 'Holiday');
 
         if (isWorkingDay && !isHoliday && !userPlan) {
           userWorkingDaysCount++;
           userWorkingDaysSet.add(dateStr);
+          const named = dayPlans
+            .map(p => (p.branchName || p.branch || '').toString().trim().toLowerCase())
+            .filter(Boolean);
+          userPlanByDate[dateStr] = named.length ? named : (isFixedJob && defaultBranchKey ? [defaultBranchKey] : []);
         }
         currentDay.setDate(currentDay.getDate() + 1);
       }
@@ -512,6 +526,9 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             serialNumber: u.serialNumber || 'N/A',
             workingDaysCount: userWorkingDaysCount,
             workingDaysSet: userWorkingDaysSet,
+            planByDate: userPlanByDate,
+            fixedJob: isFixedJob,
+            days: {} as Record<string, DayDetail>,
             attendanceDates: new Set<string>(),
             departureDates: new Set<string>(),
             lateArrivalDays: 0,
@@ -560,6 +577,13 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         
         // Only count if it's a valid working day
         if (s.workingDaysSet.has(dateKey)) {
+          const det: DayDetail = {
+            lateIn: 0, earlyIn: 0, earlyOut: 0, overtime: 0,
+            inBranch: dayData.firstIn?.branch || '', outBranch: dayData.lastOut?.branch || '',
+            plans: s.planByDate[dateKey] || []
+          };
+          s.days[dateKey] = det;
+          const mins = (str: string) => { const t = parseTimeStr(str || ''); return t.h * 60 + t.m; };
           // Process First Check-In
           if (dayData.firstIn) {
             s.attendanceDates.add(dateKey); // Count this day for attendance
@@ -572,6 +596,9 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
               const t = parseTimeStr(dayData.firstIn.timeDiff);
               s.totalLateH += t.h;
               s.totalLateM += t.m;
+              det.lateIn = mins(dayData.firstIn.timeDiff);
+            } else if (!isExcludedBranch && dayData.firstIn.timeDiff.includes('مبكر')) {
+              det.earlyIn = mins(dayData.firstIn.timeDiff);
             }
           }
 
@@ -588,9 +615,11 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                 s.earlyDepartureDays++;
                 s.totalEarlyH += t.h;
                 s.totalEarlyM += t.m;
+                det.earlyOut = t.h * 60 + t.m;
               } else if (dayData.lastOut.timeDiff.includes('متأخر')) {
                 s.totalOvertimeH += t.h;
                 s.totalOvertimeM += t.m;
+                det.overtime = t.h * 60 + t.m;
               }
             }
           }
@@ -623,7 +652,139 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
       };
     });
 
+    summaryRawRef.current = Object.values(employeeSummary);
     return summaryData;
+  };
+
+  /**
+   * تقرير الالتزام (Commitment) — بشكل ملف المتابعة: ملخّص الحضور + نسبة الالتزام
+   * + الالتزام بالخطة، وورقة «تفاصيل الحساب» للمراجعة. الحساب في commitment.ts
+   */
+  const [commitmentBusy, setCommitmentBusy] = useState(false);
+  const exportCommitmentExcel = async () => {
+    const summary = buildSummary();
+    if (!summary) return;
+    const raw = summaryRawRef.current;
+    setCommitmentBusy(true);
+    try {
+      const rows = summary.map((r, idx) => {
+        const s = raw[idx] || {};
+        const res = computeCommitment({
+          workingDays: Number(r['عدد أيام العمل المتاحة']) || 0,
+          attDays: Number(r['عدد أيام الحضور']) || 0,
+          depDays: Number(r['عدد أيام الانصراف']) || 0,
+          absDays: Number(r['عدد أيام الغياب']) || 0,
+          days: Object.values(s.days || {}) as DayDetail[]
+        });
+        return { r, res };
+      });
+
+      const ExcelJS: any = (await import('exceljs')).default || (await import('exceljs'));
+      const wb = new ExcelJS.Workbook();
+      const thin = { style: 'thin', color: { argb: 'FF808080' } };
+      const border = { top: thin, left: thin, bottom: thin, right: thin };
+      const NAVY = 'FF1F3864', BROWN = 'FF843C0C', PEACH = 'FFF8CBAD';
+      const GOOD = 'FFC6EFCE', GOOD_FG = 'FF006100', BAD = 'FFFF0000';
+
+      // ---------- الورقة الرئيسية ----------
+      const ws = wb.addWorksheet('Commitment Report', { views: [{ rightToLeft: false, state: 'frozen', ySplit: 1 }] });
+      const headers = ['S.N', 'اسم الموظف', 'عدد أيام العمل المتاحة', 'عدد أيام الحضور', 'عدد أيام الانصراف',
+        'عدد أيام الغياب', 'عدد أيام الحضور متأخر', 'عدد أيام الانصراف المبكر', 'ساعات الحضور المتأخر',
+        'ساعات الانصراف المبكر', 'ساعات الانصراف المتأخر (الإضافي)', 'Commitment rate%', 'Adherence to the Plan'];
+      const h = ws.addRow(headers);
+      h.height = 42;
+      h.eachCell((c: any, col: number) => {
+        c.font = { bold: true, color: { argb: col === 13 ? 'FF000000' : 'FFFFFFFF' }, size: 11 };
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: col === 12 ? BROWN : col === 13 ? PEACH : NAVY } };
+        c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        c.border = border;
+      });
+      rows.forEach(({ r, res }) => {
+        const serial = r['الرقم التسلسلي'];
+        const row = ws.addRow([
+          serial && serial !== 'N/A' && !isNaN(Number(serial)) ? Number(serial) : serial,
+          r['اسم الموظف'],
+          r['عدد أيام العمل المتاحة'], r['عدد أيام الحضور'], r['عدد أيام الانصراف'], r['عدد أيام الغياب'],
+          r['عدد أيام الحضور متأخر'], r['عدد أيام الانصراف المبكر'],
+          r['ساعات الحضور المتأخر'], r['ساعات الانصراف المبكر'], r['ساعات الانصراف المتأخر (الإضافي)'],
+          res.commitment === null ? '—' : res.commitment,
+          res.adherence === null ? '—' : res.adherence
+        ]);
+        row.eachCell({ includeEmpty: true }, (c: any, col: number) => {
+          c.border = border;
+          c.alignment = { horizontal: 'center', vertical: 'middle' };
+          c.font = { size: 11, bold: col >= 12 };
+          if (col >= 12 && typeof c.value === 'number') {
+            c.numFmt = col === 12 ? '0.0%' : '0%';
+            if (c.value > 0.75) {
+              c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GOOD } };
+              c.font = { size: 11, bold: true, color: { argb: GOOD_FG } };
+            } else if (c.value < 0.5) {
+              c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BAD } };
+              c.font = { size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+            }
+          }
+        });
+      });
+      [9, 32, 12, 11, 11, 10, 12, 13, 12, 12, 15, 15, 15].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+      // ---------- تفاصيل الحساب ----------
+      const ds = wb.addWorksheet('تفاصيل الحساب', { views: [{ rightToLeft: true, state: 'frozen', ySplit: 1 }] });
+      const hm = (m: number) => `${m < 0 ? '-' : ''}${Math.floor(Math.abs(m) / 60)}:${String(Math.abs(m) % 60).padStart(2, '0')}`;
+      const dh = ds.addRow(['S.N', 'اسم الموظف', 'نوع الوظيفة', 'أيام الحضور الفعلي', 'أيام بالخطة', 'رصيد التعويض (حضور مبكر + بقاء بعد الموعد)',
+        'العجز (تأخير + انصراف مبكر)', 'صافي الوقت', 'أيام عُوّضت', 'أيام تأخير محسوبة', 'أيام انصراف مبكر محسوبة',
+        'N الحضور ×0.9', 'O الحضور في الموعد ×0.1', 'P الانصراف ×0.9', 'Q الانصراف في الموعد ×0.1', 'R رصيد الوقت ×1',
+        'الالتزام بالخطة ×1', 'Commitment']);
+      dh.height = 48;
+      dh.eachCell((c: any) => {
+        c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+        c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        c.border = border;
+      });
+      rows.forEach(({ r, res }, idx) => {
+        const present = (Number(r['عدد أيام العمل المتاحة']) || 0) - (Number(r['عدد أيام الغياب']) || 0);
+        const pct = (x: number | null) => (x === null ? '—' : x);
+        const none = res.commitment === null;
+        const row = ds.addRow([
+          r['الرقم التسلسلي'], r['اسم الموظف'],
+          (raw[idx] || {}).fixedJob ? 'ثابتة (الخطة = الفرع الافتراضي)' : 'تنقل (الخطة الشهرية)',
+          present, res.planDays,
+          hm(res.compensationMin), hm(res.deficitMin), hm(res.netMin), res.coveredDays, res.effLateDays, res.effEarlyDays,
+          none ? '—' : res.N, none ? '—' : res.O, none ? '—' : res.P, none ? '—' : res.Q, none ? '—' : res.R,
+          pct(res.adherence), pct(res.commitment)
+        ]);
+        row.eachCell({ includeEmpty: true }, (c: any, col: number) => {
+          c.border = border;
+          c.alignment = { horizontal: 'center', vertical: 'middle' };
+          if (col >= 12 && typeof c.value === 'number') c.numFmt = '0.0%';
+        });
+      });
+      ds.getColumn(2).width = 32;
+      ds.getColumn(3).width = 26;
+      for (let i = 4; i <= 18; i++) ds.getColumn(i).width = i === 6 || i === 7 ? 18 : 13;
+      ds.addRow([]);
+      [
+        'الالتزام = (1×الخطة + 0.9×N + 0.1×O + 0.9×P + 0.1×Q + 1×R) ÷ 4',
+        'رصيد التعويض (الحضور المبكر + البقاء بعد الموعد) في الفترة كلها يغطي أيام التأخير والانصراف المبكر الأصغر أولاً؛ اليوم المغطّى لا يُحسب في O وQ.',
+        'O وQ: (1 − الأيام المحسوبة ÷ أيام الحضور الفعلي) × N.   R: كل 5 ساعات صافية تُخصم يوماً، والفائض يُضاف (بين 0% و100%).',
+        'الالتزام بالخطة: أيام كان فيها فرع الحضور أو الانصراف هو فرع الخطة ÷ أيام العمل المتاحة.   «—»: لا أيام عمل معتمدة في الفترة.',
+        'الوظيفة الثابتة (بلا تنقل بين الفروع): خطتها هي فرعها الافتراضي، إلا في يوم له خطة صريحة من المسؤول.'
+      ].forEach(t => { const rr = ds.addRow([t]); rr.getCell(1).font = { italic: true, color: { argb: 'FF555555' } }; });
+
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `Commitment_${username}_${fromDate}_to_${toDate}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      logAction?.('تحميل تقرير (Commitment)', `الفترة: ${fromDate} إلى ${toDate}`);
+    } catch (e) {
+      alert('تعذّر إنشاء تقرير الالتزام. تأكد من الإنترنت وحاول مجدداً.');
+    } finally {
+      setCommitmentBusy(false);
+    }
   };
 
   const exportSummaryExcel = () => {
@@ -1021,6 +1182,11 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             </button>
             <button type="button" onClick={exportDetailedExcel} className="flex items-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-black text-[10px] shadow-xl transition-all">
               <Table size={14} /> Detailed Data
+            </button>
+            <button type="button" onClick={exportCommitmentExcel} disabled={commitmentBusy}
+              className="flex items-center gap-2 px-4 py-3 text-white rounded-2xl font-black text-[10px] shadow-xl transition-all disabled:opacity-60"
+              style={{ background: '#843C0C' }} title="Commitment rate% و Adherence to the Plan">
+              {commitmentBusy ? <Loader2 size={14} className="animate-spin" /> : <TrendingUp size={14} />} Commitment
             </button>
           </div>
         </div>
