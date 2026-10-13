@@ -364,6 +364,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
    * - تسجيل في Home بينما للموظف خطة لفرع آخر = لا يُحتسب (يصبح اليوم غياباً).
    *   بلا أي خطة لذلك اليوم: يبقى كما كان (حضور بلا احتساب تأخير).
    * - تسجيل في Out Door: يُحتسب فقط إن كانت Out Door في خطة اليوم المعتمدة، وإلا لا يُحتسب.
+   *   استثناء: **الانصراف** في Out Door خارج الخطة = نصف يوم انصراف (0.5)، لا صفر.
    * الخطة للوظيفة الثابتة = فرعها الافتراضي (إلا يوماً له خطة صريحة).
    */
   const isHomeName = (n: any) => (n || '').toString().toLowerCase().includes('home');
@@ -554,6 +555,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             days: {} as Record<string, DayDetail>,
             attendanceDates: new Set<string>(),
             departureDates: new Set<string>(),
+            partialDepartureDates: new Set<string>(), // انصراف Out Door خارج الخطة = ½ يوم
             lateArrivalDays: 0,
             earlyDepartureDays: 0,
             totalLateH: 0, totalLateM: 0,
@@ -604,6 +606,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
           // تسجيل Home/Out Door خارج الخطة لا يُحتسب — كأنه لم يسجّل
           const firstIn = dayData.firstIn && registrationCounts(dayData.firstIn.branch, plansToday) ? dayData.firstIn : undefined;
           const lastOut = dayData.lastOut && registrationCounts(dayData.lastOut.branch, plansToday) ? dayData.lastOut : undefined;
+          if (!lastOut && dayData.lastOut && isOutDoorName(dayData.lastOut.branch)) s.partialDepartureDates.add(dateKey);
           const det: DayDetail = {
             lateIn: 0, earlyIn: 0, earlyOut: 0, overtime: 0,
             inBranch: firstIn?.branch || '', outBranch: lastOut?.branch || '',
@@ -659,7 +662,10 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
       const earlyTotalH = s.totalEarlyH + Math.floor(s.totalEarlyM / 60);
       const overtimeTotalH = s.totalOvertimeH + Math.floor(s.totalOvertimeM / 60);
       const attDaysCount = s.attendanceDates.size;
-      const depDaysCount = s.departureDates.size;
+      const partialDep = Array.from(s.partialDepartureDates as Set<string>).filter(d => !s.departureDates.has(d)).length;
+      const depDaysCount = s.departureDates.size + partialDep * 0.5;
+      // يوم الانصراف الجزئي ليس غياباً
+      const presentDays = Math.max(attDaysCount, s.departureDates.size + partialDep);
 
       return {
         'اسم الموظف': s.name,
@@ -670,7 +676,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         'عدد أيام العمل المتاحة': s.workingDaysCount,
         'عدد أيام الحضور': attDaysCount,
         'عدد أيام الانصراف': depDaysCount,
-        'عدد أيام الغياب': Math.max(0, s.workingDaysCount - Math.max(attDaysCount, depDaysCount)),
+        'عدد أيام الغياب': Math.max(0, s.workingDaysCount - presentDays),
         'عدد أيام الحضور متأخر': s.lateArrivalDays,
         'عدد أيام الانصراف المبكر': s.earlyDepartureDays,
         'ساعات الحضور المتأخر': `${lateTotalH}:${(s.totalLateM % 60).toString().padStart(2, '0')}`,
@@ -981,7 +987,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
           if (isOffDay) {
              outStatus = offLabel;
           } else if (rawOut && !lastOut) {
-             outStatus = notCounted;
+             outStatus = isOutDoorName(rawOut.branch) ? 'Out Door خارج الخطة (½ يوم)' : notCounted;
           } else if (lastOut) {
              const branchName = lastOut.branch?.toLowerCase() || '';
              const isExcludedBranch = branchName.includes('home') || branchName.includes('out door');
