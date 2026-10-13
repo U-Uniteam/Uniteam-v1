@@ -358,6 +358,30 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
   // تفاصيل كل موظف من آخر buildSummary (بنفس ترتيب الصفوف) — يقرؤها تقرير الالتزام
   const summaryRawRef = useRef<any[]>([]);
 
+  /**
+   * قواعد Home و Out Door (أكتوبر ٢٠٢٦):
+   * - يوم خطته Home = مثل يوم الإجازة: خارج أيام العمل، سجّل الموظف أم لم يسجّل.
+   * - تسجيل في Home بينما للموظف خطة لفرع آخر = لا يُحتسب (يصبح اليوم غياباً).
+   *   بلا أي خطة لذلك اليوم: يبقى كما كان (حضور بلا احتساب تأخير).
+   * - تسجيل في Out Door: يُحتسب فقط إن كانت Out Door في خطة اليوم المعتمدة، وإلا لا يُحتسب.
+   * الخطة للوظيفة الثابتة = فرعها الافتراضي (إلا يوماً له خطة صريحة).
+   */
+  const isHomeName = (n: any) => (n || '').toString().toLowerCase().includes('home');
+  const isOutDoorName = (n: any) => (n || '').toString().toLowerCase().replace(/\s+/g, '') === 'outdoor';
+  const registrationCounts = (branch: any, plans: string[]) => {
+    if (isHomeName(branch)) return plans.length === 0;
+    if (isOutDoorName(branch)) return plans.some(isOutDoorName);
+    return true;
+  };
+  /** فروع خطة اليوم بعد تطبيق «الفرع الافتراضي = الخطة» للوظيفة الثابتة */
+  const effectivePlans = (dayPlans: any[], isFixedJob: boolean, defaultBranchKey: string) => {
+    const named = dayPlans
+      .filter(p => p.branchName !== 'Holiday')
+      .map(p => (p.branchName || p.branch || '').toString().trim().toLowerCase())
+      .filter(Boolean);
+    return named.length ? named : (isFixedJob && defaultBranchKey ? [defaultBranchKey] : []);
+  };
+
   const buildSummary = (silent = false): any[] | null => {
     if (!fromDate || !toDate) { if (!silent) alert('يرجى تحديد الفترة (من تاريخ / إلى تاريخ) لحساب الملخص'); return null; }
     
@@ -507,13 +531,12 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         });
         const userPlan = dayPlans.find(p => p.branchName === 'Holiday');
 
-        if (isWorkingDay && !isHoliday && !userPlan) {
+        const plansToday = effectivePlans(dayPlans, isFixedJob, defaultBranchKey);
+        // يوم خطته Home يُعامل كيوم إجازة
+        if (isWorkingDay && !isHoliday && !userPlan && !plansToday.some(isHomeName)) {
           userWorkingDaysCount++;
           userWorkingDaysSet.add(dateStr);
-          const named = dayPlans
-            .map(p => (p.branchName || p.branch || '').toString().trim().toLowerCase())
-            .filter(Boolean);
-          userPlanByDate[dateStr] = named.length ? named : (isFixedJob && defaultBranchKey ? [defaultBranchKey] : []);
+          userPlanByDate[dateStr] = plansToday;
         }
         currentDay.setDate(currentDay.getDate() + 1);
       }
@@ -577,46 +600,50 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         
         // Only count if it's a valid working day
         if (s.workingDaysSet.has(dateKey)) {
+          const plansToday: string[] = s.planByDate[dateKey] || [];
+          // تسجيل Home/Out Door خارج الخطة لا يُحتسب — كأنه لم يسجّل
+          const firstIn = dayData.firstIn && registrationCounts(dayData.firstIn.branch, plansToday) ? dayData.firstIn : undefined;
+          const lastOut = dayData.lastOut && registrationCounts(dayData.lastOut.branch, plansToday) ? dayData.lastOut : undefined;
           const det: DayDetail = {
             lateIn: 0, earlyIn: 0, earlyOut: 0, overtime: 0,
-            inBranch: dayData.firstIn?.branch || '', outBranch: dayData.lastOut?.branch || '',
-            plans: s.planByDate[dateKey] || []
+            inBranch: firstIn?.branch || '', outBranch: lastOut?.branch || '',
+            plans: plansToday
           };
           s.days[dateKey] = det;
           const mins = (str: string) => { const t = parseTimeStr(str || ''); return t.h * 60 + t.m; };
           // Process First Check-In
-          if (dayData.firstIn) {
+          if (firstIn) {
             s.attendanceDates.add(dateKey); // Count this day for attendance
             
-            const branchName = dayData.firstIn.branch?.toLowerCase() || '';
+            const branchName = firstIn.branch?.toLowerCase() || '';
             const isExcludedBranch = branchName.includes('home') || branchName.includes('out door');
             
-            if (!isExcludedBranch && dayData.firstIn.timeDiff.includes('متأخر')) {
+            if (!isExcludedBranch && firstIn.timeDiff.includes('متأخر')) {
               s.lateArrivalDays++;
-              const t = parseTimeStr(dayData.firstIn.timeDiff);
+              const t = parseTimeStr(firstIn.timeDiff);
               s.totalLateH += t.h;
               s.totalLateM += t.m;
-              det.lateIn = mins(dayData.firstIn.timeDiff);
-            } else if (!isExcludedBranch && dayData.firstIn.timeDiff.includes('مبكر')) {
-              det.earlyIn = mins(dayData.firstIn.timeDiff);
+              det.lateIn = mins(firstIn.timeDiff);
+            } else if (!isExcludedBranch && firstIn.timeDiff.includes('مبكر')) {
+              det.earlyIn = mins(firstIn.timeDiff);
             }
           }
 
           // Process Last Check-Out
-          if (dayData.lastOut) {
+          if (lastOut) {
             s.departureDates.add(dateKey); // Count this day for departure
             
-            const branchName = dayData.lastOut.branch?.toLowerCase() || '';
+            const branchName = lastOut.branch?.toLowerCase() || '';
             const isExcludedBranch = branchName.includes('home') || branchName.includes('out door');
             
             if (!isExcludedBranch) {
-              const t = parseTimeStr(dayData.lastOut.timeDiff);
-              if (dayData.lastOut.timeDiff.includes('مبكر')) {
+              const t = parseTimeStr(lastOut.timeDiff);
+              if (lastOut.timeDiff.includes('مبكر')) {
                 s.earlyDepartureDays++;
                 s.totalEarlyH += t.h;
                 s.totalEarlyM += t.m;
                 det.earlyOut = t.h * 60 + t.m;
-              } else if (dayData.lastOut.timeDiff.includes('متأخر')) {
+              } else if (lastOut.timeDiff.includes('متأخر')) {
                 s.totalOvertimeH += t.h;
                 s.totalOvertimeM += t.m;
                 det.overtime = t.h * 60 + t.m;
@@ -661,30 +688,35 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
    * + الالتزام بالخطة، وورقة «تفاصيل الحساب» للمراجعة. الحساب في commitment.ts
    */
   const [commitmentBusy, setCommitmentBusy] = useState(false);
+
+  /** الالتزام لكل صف ملخّص — مصدر واحد لملف Excel ولوحة الالتزام فلا يختلف الرقمان */
+  const commitmentRows = (summary: any[], raw: any[]) => summary.map((r, idx) => {
+    const s = raw[idx] || {};
+    const res = computeCommitment({
+      workingDays: Number(r['عدد أيام العمل المتاحة']) || 0,
+      attDays: Number(r['عدد أيام الحضور']) || 0,
+      depDays: Number(r['عدد أيام الانصراف']) || 0,
+      absDays: Number(r['عدد أيام الغياب']) || 0,
+      days: Object.values(s.days || {}) as DayDetail[]
+    });
+    return { r, res, fixedJob: !!s.fixedJob };
+  });
+
   const exportCommitmentExcel = async () => {
     const summary = buildSummary();
     if (!summary) return;
     const raw = summaryRawRef.current;
     setCommitmentBusy(true);
     try {
-      const rows = summary.map((r, idx) => {
-        const s = raw[idx] || {};
-        const res = computeCommitment({
-          workingDays: Number(r['عدد أيام العمل المتاحة']) || 0,
-          attDays: Number(r['عدد أيام الحضور']) || 0,
-          depDays: Number(r['عدد أيام الانصراف']) || 0,
-          absDays: Number(r['عدد أيام الغياب']) || 0,
-          days: Object.values(s.days || {}) as DayDetail[]
-        });
-        return { r, res };
-      });
+      const rows = commitmentRows(summary, raw);
 
       const ExcelJS: any = (await import('exceljs')).default || (await import('exceljs'));
       const wb = new ExcelJS.Workbook();
       const thin = { style: 'thin', color: { argb: 'FF808080' } };
       const border = { top: thin, left: thin, bottom: thin, right: thin };
       const NAVY = 'FF1F3864', BROWN = 'FF843C0C', PEACH = 'FFF8CBAD';
-      const GOOD = 'FFC6EFCE', GOOD_FG = 'FF006100', BAD = 'FFFF0000';
+      // نفس حدود لوحة الالتزام: ≥90٪ ممتاز · 75–89٪ متوسط · <75٪ يحتاج متابعة
+      const GOOD = 'FFC6EFCE', GOOD_FG = 'FF006100', MID = 'FFFFEB9C', MID_FG = 'FF9C5700', BAD = 'FFFF0000';
 
       // ---------- الورقة الرئيسية ----------
       const ws = wb.addWorksheet('Commitment Report', { views: [{ rightToLeft: false, state: 'frozen', ySplit: 1 }] });
@@ -716,10 +748,13 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
           c.font = { size: 11, bold: col >= 12 };
           if (col >= 12 && typeof c.value === 'number') {
             c.numFmt = col === 12 ? '0.0%' : '0%';
-            if (c.value > 0.75) {
+            if (c.value >= 0.895) {
               c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GOOD } };
               c.font = { size: 11, bold: true, color: { argb: GOOD_FG } };
-            } else if (c.value < 0.5) {
+            } else if (c.value >= 0.745) {
+              c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: MID } };
+              c.font = { size: 11, bold: true, color: { argb: MID_FG } };
+            } else {
               c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BAD } };
               c.font = { size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
             }
@@ -742,13 +777,13 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
         c.border = border;
       });
-      rows.forEach(({ r, res }, idx) => {
+      rows.forEach(({ r, res, fixedJob }) => {
         const present = (Number(r['عدد أيام العمل المتاحة']) || 0) - (Number(r['عدد أيام الغياب']) || 0);
         const pct = (x: number | null) => (x === null ? '—' : x);
         const none = res.commitment === null;
         const row = ds.addRow([
           r['الرقم التسلسلي'], r['اسم الموظف'],
-          (raw[idx] || {}).fixedJob ? 'ثابتة (الخطة = الفرع الافتراضي)' : 'تنقل (الخطة الشهرية)',
+          fixedJob ? 'ثابتة (الخطة = الفرع الافتراضي)' : 'تنقل (الخطة الشهرية)',
           present, res.planDays,
           hm(res.compensationMin), hm(res.deficitMin), hm(res.netMin), res.coveredDays, res.effLateDays, res.effEarlyDays,
           none ? '—' : res.N, none ? '—' : res.O, none ? '—' : res.P, none ? '—' : res.Q, none ? '—' : res.R,
@@ -868,6 +903,8 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
       const userId = u.serialNumber && u.serialNumber !== 'undefined' ? u.serialNumber : u.fullName;
       const userJob = fetchedJobs.find(j => j.title === u.jobTitle);
       const workingDays = userJob?.workingDays || [0, 1, 2, 3, 4, 6]; // Default all except Friday
+      const isFixedJob = !(userJob && userJob.canVisitMultipleBranches);
+      const defaultBranchKey = (getBranchName(u.defaultBranch, u) || '').toString().trim().toLowerCase();
 
       const dayWalker = new Date(currentDayBase);
       while (true) {
@@ -880,8 +917,8 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         const isHoliday = fetchedHolidays.includes(dateKey);
         const isWorkingDay = workingDays.includes(dayOfWeek);
 
-        // Find visit plan for this user and date
-        const plan = visitPlans.find(p => {
+        // Find visit plans for this user and date
+        const dayPlans = visitPlans.filter(p => {
           if (!p.date) return false;
           const pDateStr = getDateString(p.date);
           if (pDateStr !== dateKey) return false;
@@ -907,17 +944,27 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
           );
         });
 
+        const plan = dayPlans.find(p => p.branchName === 'Holiday') || dayPlans[0];
         const isPlanHoliday = plan?.branchName === 'Holiday';
-        const isOffDay = isHoliday || !isWorkingDay || isPlanHoliday;
+        const plansToday = effectivePlans(dayPlans, isFixedJob, defaultBranchKey);
+        const isPlanHome = !isPlanHoliday && plansToday.some(isHomeName); // يوم Home = مثل الإجازة
+        const isOffDay = isHoliday || !isWorkingDay || isPlanHoliday || isPlanHome;
+        const offLabel = isPlanHome ? 'Home' : 'اجازة';
 
         // Show if it's a working day OR if there are records OR if there is a visit plan
         if (isWorkingDay || dayData || plan) {
-          const firstIn = dayData?.firstIn;
-          const lastOut = dayData?.lastOut;
+          // تسجيل Home/Out Door خارج خطة اليوم لا يُحتسب (يُعامل كأنه لم يسجّل)
+          const rawIn = dayData?.firstIn;
+          const rawOut = dayData?.lastOut;
+          const firstIn = rawIn && registrationCounts(rawIn.branch, plansToday) ? rawIn : undefined;
+          const lastOut = rawOut && registrationCounts(rawOut.branch, plansToday) ? rawOut : undefined;
+          const notCounted = 'غير محتسب (خارج الخطة)';
           
           let inStatus = '';
           if (isOffDay) {
-             inStatus = 'اجازة';
+             inStatus = offLabel;
+          } else if (rawIn && !firstIn) {
+             inStatus = notCounted;
           } else if (firstIn) {
              const branchName = firstIn.branch?.toLowerCase() || '';
              const isExcludedBranch = branchName.includes('home') || branchName.includes('out door');
@@ -932,7 +979,9 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
 
           let outStatus = '';
           if (isOffDay) {
-             outStatus = 'اجازة';
+             outStatus = offLabel;
+          } else if (rawOut && !lastOut) {
+             outStatus = notCounted;
           } else if (lastOut) {
              const branchName = lastOut.branch?.toLowerCase() || '';
              const isExcludedBranch = branchName.includes('home') || branchName.includes('out door');
@@ -949,14 +998,15 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             'الرقم التسلسلي': u.serialNumber || 'N/A',
             'اسم الموظف': u.fullName,
             'اليوم': dateKey,
-            'الخطة': plan ? (plan.branchName || plan.branch || 'خطة موجودة') : 'لا توجد خطة',
-            'وقت الحضور': firstIn ? new Date(firstIn.time).toLocaleTimeString('en-US') : 'لم يسجل',
-            'كود فرع الحضور': firstIn ? getBranchCode(firstIn.branch, firstIn) : '',
-            'فرع الحضور': firstIn ? firstIn.branch : '',
+            'الخطة': plan ? (plan.branchName || plan.branch || 'خطة موجودة')
+              : plansToday.length ? `${getBranchName(u.defaultBranch, u)} (الفرع الافتراضي)` : 'لا توجد خطة',
+            'وقت الحضور': rawIn ? new Date(rawIn.time).toLocaleTimeString('en-US') : 'لم يسجل',
+            'كود فرع الحضور': rawIn ? getBranchCode(rawIn.branch, rawIn) : '',
+            'فرع الحضور': rawIn ? rawIn.branch : '',
             'حالة الحضور': inStatus,
-            'وقت الانصراف': lastOut ? new Date(lastOut.time).toLocaleTimeString('en-US') : 'لم يسجل',
-            'كود فرع الانصراف': lastOut ? getBranchCode(lastOut.branch, lastOut) : '',
-            'فرع الانصراف': lastOut ? lastOut.branch : '',
+            'وقت الانصراف': rawOut ? new Date(rawOut.time).toLocaleTimeString('en-US') : 'لم يسجل',
+            'كود فرع الانصراف': rawOut ? getBranchCode(rawOut.branch, rawOut) : '',
+            'فرع الانصراف': rawOut ? rawOut.branch : '',
             'حالة الانصراف': outStatus
           });
         }
@@ -1069,7 +1119,13 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
    * في حقل بحث اللوحة. التذكير هنا يقصرها على تغيّر مدخلاتها الفعلية.
    */
   const dashboardRows = useMemo(
-    () => buildSummary(true),
+    () => {
+      const summary = buildSummary(true);
+      if (!summary) return summary;
+      // __c / __a: Commitment والالتزام بالخطة (null = لا أيام عمل معتمدة)
+      return commitmentRows(summary, summaryRawRef.current)
+        .map(({ r, res }) => ({ ...r, __c: res.commitment, __a: res.adherence }));
+    },
     [records, authorizedUsers, visitPlans, fetchedJobs, fetchedBranches, fetchedHolidays,
      fromDate, toDate, selectedJobs, selectedEmployees, selectedBranches]
   );
@@ -1291,26 +1347,30 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         const totEarly= rows.reduce((a, r) => a + num(r['عدد أيام الانصراف المبكر']), 0);
         const lateMin = rows.reduce((a, r) => a + hmToMin(r['ساعات الحضور المتأخر']), 0);
         const otMin   = rows.reduce((a, r) => a + hmToMin(r['ساعات الانصراف المتأخر (الإضافي)']), 0);
-        const rate    = totWork > 0 ? Math.round((totAtt / totWork) * 100) : 0;
+        // مؤشر الالتزام = Commitment rate% (نفس تقرير Excel). -1 = لا أيام عمل («—»)
+        const rateOf = (r: any) => (r.__c === null || r.__c === undefined ? -1 : Math.round(r.__c * 100));
+        const planOf = (r: any) => (r.__a === null || r.__a === undefined ? -1 : Math.round(r.__a * 100));
+        const pctText = (v: number) => (v < 0 ? '—' : `${v}%`);
+        const rated = rows.filter(r => rateOf(r) >= 0);
+        const avg = (f: (r: any) => number) => rated.length ? Math.round(rated.reduce((a, r) => a + f(r), 0) / rated.length) : 0;
+        const rate = avg(rateOf);
+        const planRate = avg(planOf);
 
-        const rateOf = (r: any) => {
-          const w = num(r['عدد أيام العمل المتاحة']);
-          return w > 0 ? Math.round((num(r['عدد أيام الحضور']) / w) * 100) : 0;
-        };
         const ranked = [...rows].sort((a, b) => rateOf(b) - rateOf(a));
         const single = ranked.length === 1 ? ranked[0] : null;
 
         const highCount = ranked.filter(r => rateOf(r) >= 90).length;
         const medCount  = ranked.filter(r => rateOf(r) >= 75 && rateOf(r) < 90).length;
-        const lowCount  = ranked.filter(r => rateOf(r) < 75).length;
-        const topPerformer = ranked.length > 0 ? ranked[0] : null;
+        const lowCount  = ranked.filter(r => rateOf(r) >= 0 && rateOf(r) < 75).length;
+        const topPerformer = ranked.length > 0 && rateOf(ranked[0]) >= 0 ? ranked[0] : null;
+        const colorOf = (pr: number) => (pr < 0 ? '#64748B' : pr >= 90 ? '#34D399' : pr >= 75 ? '#FBBF24' : '#F87171');
 
         const filteredRanked = ranked.filter(r => {
           const pr = rateOf(r);
           let passFilter = true;
           if (dashFilter === 'high') passFilter = pr >= 90;
           else if (dashFilter === 'med') passFilter = pr >= 75 && pr < 90;
-          else if (dashFilter === 'low') passFilter = pr < 75;
+          else if (dashFilter === 'low') passFilter = pr >= 0 && pr < 75;
 
           if (!passFilter) return false;
 
@@ -1360,8 +1420,9 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
               </div>
 
               {/* ===== المؤشرات الرئيسية ===== */}
-              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
-                <KPI label="نسبة الالتزام" value={rate} unit="%" tone="var(--el-400)" icon={TrendingUp} />
+              <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
+                <KPI label="نسبة الالتزام" value={rated.length ? rate : '—'} unit={rated.length ? '%' : ''} tone="var(--el-400)" icon={TrendingUp} />
+                <KPI label="الالتزام بالخطة" value={rated.length ? planRate : '—'} unit={rated.length ? '%' : ''} tone="#38BDF8" icon={MapPin} />
                 <KPI label="أيام الحضور" value={totAtt} unit={`من ${totWork}`} tone="#34D399" icon={CheckCircle} />
                 <KPI label="أيام الغياب" value={totAbs} unit="يوم" tone="#F87171" icon={X} />
                 <KPI label="أيام التأخير" value={totLate} unit="يوم" tone="#FBBF24" icon={Clock} />
@@ -1397,7 +1458,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                   <div className="bg-emerald-950/20 border border-emerald-500/30 rounded-2xl p-4 flex flex-col justify-between">
                     <div className="flex items-center justify-between text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-1">
                       <span>الأبرز التزاماً 🏆</span>
-                      <span className="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-md font-bold">{rateOf(topPerformer)}%</span>
+                      <span className="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-md font-bold">{pctText(rateOf(topPerformer))}</span>
                     </div>
                     <div>
                       <div className="text-white text-sm font-black truncate">{topPerformer['اسم الموظف']}</div>
@@ -1424,10 +1485,13 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                       </div>
                     </div>
                     <div className="text-left">
-                      <div className="text-2xl md:text-3xl font-black" style={{ color: rateOf(single) >= 90 ? '#34D399' : rateOf(single) >= 75 ? '#FBBF24' : '#F87171', direction: 'ltr' }}>
-                        {rateOf(single)}%
+                      <div className="text-2xl md:text-3xl font-black" style={{ color: colorOf(rateOf(single)), direction: 'ltr' }}>
+                        {pctText(rateOf(single))}
                       </div>
                       <div className="text-[10px] font-black text-slate-400 uppercase">نسبة الالتزام</div>
+                      <div className="text-[11px] font-black mt-1" style={{ color: colorOf(planOf(single)), direction: 'ltr' }}>
+                        {pctText(planOf(single))} <span className="text-slate-400">الالتزام بالخطة</span>
+                      </div>
                     </div>
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
@@ -1515,20 +1579,22 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                           <th className="py-3.5 px-3 text-center">الغياب</th>
                           <th className="py-3.5 px-3 text-center">التأخير</th>
                           <th className="py-3.5 px-3 text-center">ساعات التأخير</th>
+                          <th className="py-3.5 px-3 text-center">الالتزام بالخطة</th>
                           <th className="py-3.5 px-3 text-center w-48">مؤشر الالتزام</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-700/40">
                         {filteredRanked.length === 0 ? (
                           <tr>
-                            <td colSpan={7} className="py-8 text-center text-slate-400 text-xs font-bold bg-slate-900/20">
+                            <td colSpan={8} className="py-8 text-center text-slate-400 text-xs font-bold bg-slate-900/20">
                               لا توجد نتائج تطابق خيارات البحث أوالفلتر الحالية
                             </td>
                           </tr>
                         ) : (
                           filteredRanked.map((r, i) => {
                             const pr = rateOf(r);
-                            const col = pr >= 90 ? 'var(--ok)' : pr >= 75 ? 'var(--warn)' : 'var(--bad)';
+                            const pp = planOf(r);
+                            const col = pr < 0 ? '#64748B' : pr >= 90 ? 'var(--ok)' : pr >= 75 ? 'var(--warn)' : 'var(--bad)';
                             const originalRank = ranked.findIndex(x => x['اسم الموظف'] === r['اسم الموظف']) + 1;
 
                             return (
@@ -1552,12 +1618,15 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
                                 <td data-label="ساعات التأخير" className="py-3 px-3 text-center text-[11px] font-black text-slate-300" style={{ direction: 'ltr' }}>
                                   {r['ساعات الحضور المتأخر']}
                                 </td>
+                                <td data-label="الالتزام بالخطة" className="py-3 px-3 text-center text-xs font-black" style={{ color: colorOf(pp), direction: 'ltr' }}>
+                                  {pctText(pp)}
+                                </td>
                                 <td data-label="مؤشر الالتزام" className="py-3 px-3">
                                   <div className="flex items-center gap-2">
                                     <div className="flex-1 h-2 rounded-full bg-slate-950 overflow-hidden p-0.5 border border-slate-800">
-                                      <div className="h-full rounded-full transition-all duration-300" style={{ width: `${pr}%`, background: col }} />
+                                      <div className="h-full rounded-full transition-all duration-300" style={{ width: `${Math.max(0, pr)}%`, background: col }} />
                                     </div>
-                                    <span className="text-[11px] font-black w-10 text-left" style={{ color: col, direction: 'ltr' }}>{pr}%</span>
+                                    <span className="text-[11px] font-black w-10 text-left" style={{ color: col, direction: 'ltr' }}>{pctText(pr)}</span>
                                   </div>
                                 </td>
                               </tr>
