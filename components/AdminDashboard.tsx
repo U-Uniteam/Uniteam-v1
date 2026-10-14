@@ -30,6 +30,10 @@ interface AdminDashboardProps {
   logAction: (action: string, details?: string) => void;
 }
 
+/** نوع الجهاز من بادئة معرّفه — ليميّز المسؤول الأجهزة عند فك ارتباط واحد منها */
+const deviceLabel = (id: string): string =>
+  id.startsWith('android_') ? 'أندرويد' : id.startsWith('win_') ? 'ويندوز' : id.startsWith('hw_') ? 'متصفح' : 'جهاز';
+
 const AdminDashboard: React.FC<AdminDashboardProps> = ({ 
   branches, setBranches, jobs, setJobs, records, config, setConfig, allUsers, setAllUsers, 
   reportAccounts = [], setReportAccounts, visitPlans, setVisitPlans, onRefresh, isSyncing, logAction
@@ -103,6 +107,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [editUserData, setEditUserData] = useState<Partial<User>>({});
   const [resettingUserId, setResettingUserId] = useState<string | null>(null);
   const [newAdminPass, setNewAdminPass] = useState('');
+  // الموظف المفتوحة قائمة أجهزته في الجدول (لفك ارتباط جهاز بعينه)
+  const [devicesOpenId, setDevicesOpenId] = useState<string | null>(null);
 
   /**
    * إعادة تعيين كلمة مرور موظف.
@@ -141,7 +147,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const text = (await response.text()).trim();
 
       if (text.includes('Password Reset Successfully')) {
-        alert(`تم تغيير كلمة مرور ${user.fullName} بنجاح.\n\nسلّمها له ليدخل بها.`);
+        alert(`تم تغيير كلمة مرور ${user.fullName} بنجاح.\n\nسلّمها له ليدخل بها فوراً (يُلغى أي إيقاف بسبب المحاولات الخاطئة).`);
         logAction('إعادة تعيين كلمة مرور موظف', `الموظف: ${user.fullName}`);
         onRefresh?.();
       } else {
@@ -668,8 +674,32 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                              <input type="number" min="1" max="10" className="bg-slate-900 border border-blue-500 rounded px-2 py-1 text-xs w-12 text-center text-white" value={editUserData.allowedDeviceCount || 1} onChange={e => setEditUserData({...editUserData, allowedDeviceCount: parseInt(e.target.value) || 1})} />
                            </div>
                         ) : (
-                           <div className={`flex items-center justify-center gap-1 px-3 py-1 rounded-full text-[9px] font-black border mx-auto w-fit ${deviceCount > 0 ? 'bg-green-600/10 text-green-400 border-green-900/30' : 'bg-slate-900 text-slate-500 border-slate-700'}`}>
-                             <Smartphone size={10} /> {deviceCount} / {allowedCount}
+                           <div className="flex flex-col items-center gap-1.5">
+                             <button type="button" disabled={deviceCount === 0}
+                               onClick={() => setDevicesOpenId(devicesOpenId === user.id ? null : user.id)}
+                               title={deviceCount > 0 ? 'عرض الأجهزة المربوطة' : 'لا أجهزة مربوطة'}
+                               className={`flex items-center justify-center gap-1 px-3 py-1 rounded-full text-[9px] font-black border mx-auto w-fit ${deviceCount > 0 ? 'bg-green-600/10 text-green-400 border-green-900/30 hover:border-green-500 cursor-pointer' : 'bg-slate-900 text-slate-500 border-slate-700'}`}>
+                               <Smartphone size={10} /> {deviceCount} / {allowedCount}
+                             </button>
+                             {/* فك ارتباط جهاز واحد بعينه — بقية الأجهزة تبقى */}
+                             {devicesOpenId === user.id && (user.deviceIds || []).map((d, i) => (
+                               <div key={d} className="flex items-center gap-1.5 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-slate-300 font-bold">
+                                 <span>{i + 1}. {deviceLabel(d)}</span>
+                                 <span className="font-mono text-slate-500" dir="ltr">…{d.slice(-6)}</span>
+                                 <button type="button" disabled={savingKey === 'user:' + user.id} title="فك ارتباط هذا الجهاز فقط"
+                                   onClick={() => {
+                                     if (!confirm(`فك ارتباط ${deviceLabel(d)} (…${d.slice(-6)}) من حساب ${user.fullName}؟\nبقية أجهزته تبقى مربوطة.`)) return;
+                                     adminCall('user:' + user.id, 'adminRemoveDevice', { userId: user.id, deviceId: d }).then(res => {
+                                       if (!res.ok) return;
+                                       const kept: string[] = res.deviceIds || (user.deviceIds || []).filter(x => x !== d);
+                                       setAllUsers(prev => prev.map(u => u.id === user.id ? { ...u, deviceIds: kept, deviceId: kept[0] || '' } : u));
+                                       if (kept.length === 0) setDevicesOpenId(null);
+                                       logAction('فك ارتباط جهاز واحد', `الموظف: ${user.fullName}, الجهاز: ${deviceLabel(d)} …${d.slice(-6)}`);
+                                     });
+                                   }}
+                                   className="text-orange-400 hover:text-orange-300 disabled:opacity-50"><X size={13} /></button>
+                               </div>
+                             ))}
                            </div>
                         )}
                      </td>
@@ -724,6 +754,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                       adminCall('user:' + user.id, 'adminResetDevices', { userId: user.id }).then(res => {
                                         if (!res.ok) return;
                                         setAllUsers(prev => prev.map(u => u.id === user.id ? {...u, deviceId: "", deviceIds: []} : u));
+                                        setDevicesOpenId(null);
                                         logAction('فك ارتباط أجهزة', `الموظف: ${user.fullName}`);
                                       });
                                     }
