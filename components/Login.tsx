@@ -8,6 +8,10 @@ import { LogoMark } from './Logo';
 // التقارير تُحمَّل عند فتح تبويبها فقط — انظر LazyScreens.tsx
 import { LazyReportsView, ScreenLoader } from './LazyScreens';
 
+/** مهلة انتظار ردّ الخادم: أول تشغيل لخادم جوجل بعد فترة خمول قد يأخذ ثوانيَ طويلة */
+const REGISTER_TIMEOUT_MS = 45000;
+const LOGIN_TIMEOUT_MS = 30000;
+
 interface LoginProps {
   onLogin: (user: User) => void;
   adminConfig: AppConfig;
@@ -224,17 +228,27 @@ export default function Login({
         jobTitle: selectedJob,
         defaultBranchId: branchObj ? branchObj.name : defaultBranch,
         deviceId: getDeviceFingerprint()
-      });
+      }, REGISTER_TIMEOUT_MS);
     } catch (err: any) {
-      setIsLoading(false);
-      const msg = describeNetError(err);
-      setError('لم يُنشأ الحساب. ' + msg);
-      logAction('فشل تسجيل مستخدم جديد', `السبب: ${msg}`);
-      return;
+      // انقطع الردّ — لكن الخادم ربما أنشأ الحساب فعلاً (يحدث مع بطء الشبكة أو أول
+      // تشغيل للخادم). نتحقّق بالدخول بنفس البيانات بدل إعلان فشل قد يكون غير صحيح.
+      try {
+        res = await postJson(url, {
+          action: 'loginEmployee', nationalId, password, deviceId: getDeviceFingerprint()
+        }, LOGIN_TIMEOUT_MS);
+        if (res && !res.ok && !res.pending) res = null; // لم يُنشأ الحساب فعلاً
+      } catch { res = null; }
+      if (!res) {
+        setIsLoading(false);
+        const msg = describeNetError(err);
+        setError('لم يصل تأكيد من الخادم. ' + msg + ' إن ضغطت «تسجيل» مرة أخرى بنفس البيانات فلن يتكرر الحساب.');
+        logAction('تسجيل مستخدم جديد بلا تأكيد', `السبب: ${msg}`);
+        return;
+      }
     }
     setIsLoading(false);
 
-    if (!res || !res.ok) {
+    if (!res || (!res.ok && !res.pending)) {
       setError('لم يُنشأ الحساب: ' + ((res && res.error) || 'ردّ غير متوقع من الخادم.'));
       logAction('فشل تسجيل مستخدم جديد', `رفض الخادم: ${(res && res.error) || ''}`);
       return;
@@ -283,7 +297,7 @@ export default function Login({
         nationalId: trimmedNId,
         password: password.trim(),
         deviceId: getDeviceFingerprint()
-      });
+      }, LOGIN_TIMEOUT_MS);
     } catch (err: any) {
       setIsLoading(false);
       setError(describeNetError(err));

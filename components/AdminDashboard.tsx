@@ -293,7 +293,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
           }))]); 
           logAction('استيراد فروع', `تم استيراد ${data.length} فرع من ملف إكسل`);
         } else if (type === 'jobs') { 
-          saveJobs(prev => [...prev, ...data.map((item: any) => ({ id: Math.random().toString(36).substr(2, 9), title: item["اسم الوظيفة"] || 'موظف', canVisitMultipleBranches: item["زيارة فروع متعددة"] === "نعم" }))]); 
+          saveJobs(prev => [...prev, ...data.map((item: any) => ({ id: Math.random().toString(36).substr(2, 9), title: String(item["اسم الوظيفة"] || 'موظف').replace(/\s+/g, ' ').trim(), canVisitMultipleBranches: item["زيارة فروع متعددة"] === "نعم" }))]); 
           logAction('استيراد وظائف', `تم استيراد ${data.length} وظيفة من ملف إكسل`);
         } else if (type === 'plans') {
           const newPlans = data.map((item: any) => {
@@ -879,7 +879,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                </div>
                <div className="flex flex-col sm:flex-row gap-2">
                   <input type="text" placeholder="عنوان الوظيفة الجديد" className="bg-slate-900 border border-slate-700 focus:border-blue-500 rounded-xl px-3 py-2 text-xs outline-none text-white flex-1 min-w-0" value={newJobTitle} onChange={e => setNewJobTitle(e.target.value)} />
-                  <button onClick={() => { if(newJobTitle.trim()) { saveJobs([...jobs, { id: Math.random().toString(36).substr(2, 9), title: newJobTitle, workingDays: [0, 1, 2, 3, 4, 6] }]); logAction('إضافة وظيفة جديدة', `الوظيفة: ${newJobTitle}`); setNewJobTitle(''); } }} className="bg-blue-600 hover:bg-blue-500 text-white rounded-xl px-4 py-2 text-xs font-black flex items-center justify-center gap-1.5 transition-all shrink-0 shadow-md"><Plus size={16}/> إضافة وظيفة</button>
+                  <button onClick={() => { if(newJobTitle.trim()) { saveJobs([...jobs, { id: Math.random().toString(36).substr(2, 9), title: newJobTitle.replace(/\s+/g, ' ').trim(), workingDays: [0, 1, 2, 3, 4, 6] }]); logAction('إضافة وظيفة جديدة', `الوظيفة: ${newJobTitle}`); setNewJobTitle(''); } }} className="bg-blue-600 hover:bg-blue-500 text-white rounded-xl px-4 py-2 text-xs font-black flex items-center justify-center gap-1.5 transition-all shrink-0 shadow-md"><Plus size={16}/> إضافة وظيفة</button>
                </div>
             </div>
 
