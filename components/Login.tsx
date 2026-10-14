@@ -3,79 +3,13 @@ import React, { useState, useRef } from 'react';
 import { User, AppConfig, Job, Branch } from '../types';
 import { UserPlus, LogIn, LogOut, ShieldAlert, Briefcase, Loader2, Link as LinkIcon, Smartphone, AlertCircle, WifiOff, MapPin, Eye, EyeOff, FileSpreadsheet, ArrowRight, KeyRound } from 'lucide-react';
 import { getDeviceFingerprint, getSavedLogin, setSavedLogin, clearSavedLogin } from '../utils';
+import { postJson, describeNetError, setEmployeeToken, setApproverSession, loginApprover } from './session';
 import { LogoMark } from './Logo';
 // التقارير تُحمَّل عند فتح تبويبها فقط — انظر LazyScreens.tsx
 import { LazyReportsView, ScreenLoader } from './LazyScreens';
 
-/**
- * مهلة مزامنة ما قبل الدخول.
- *
- * ثمانِ ثوانٍ: أطول من أي شبكة معقولة، وأقصر من صبر موظف واقف في الشارع.
- * عند تجاوزها يُكمل الدخول بالقائمة المحلية بدل أن يتجمّد الزر.
- */
-const PRE_LOGIN_SYNC_TIMEOUT_MS = 8000;
-
-/** مهلة تأكيد ربط الجهاز — أطول لأنها خطوة تأكيد لا تكرار */
-const DEVICE_LINK_SYNC_TIMEOUT_MS = 15000;
-
-/** مهلة الكتابة على الخادم — نفس مهلة تسجيل الحضور */
-const WRITE_TIMEOUT_MS = 20000;
-
-/**
- * إرسال أمر كتابة للخادم وقراءة ردّه فعلاً.
- *
- * كان التسجيل وربط الجهاز يستعملان `mode: 'no-cors'`، وهو يُعمي الاستجابة
- * تماماً: الطلب "ينجح" مهما ردّ الخادم — بل ومهما رفض. فكان الموظف يُدخَل
- * للتطبيق وحسابه لم يصل الشيت، أو جهازه لم يُربط، وهو لا يدري.
- *
- * `text/plain` طلب بسيط لا يستدعي preflight، وهو نفس ما يفعله مسار تسجيل
- * الحضور الذي يقرأ ردّ الخادم بنجاح منذ البداية.
- *
- * @returns نصّ الردّ بعد التشذيب
- * @throws  Error برسالة مصنّفة: SERVER_404 · INVALID_RESPONSE · AbortError
- */
-const postToServer = async (url: string, payload: any): Promise<string> => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), WRITE_TIMEOUT_MS);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  if (response.status === 404) throw new Error('SERVER_404');
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-  const text = (await response.text()).trim();
-  // صفحة تسجيل دخول جوجل أو صفحة خطأ HTML بدل ردّ الكود
-  if (!text || text.startsWith('<')) throw new Error('INVALID_RESPONSE');
-  return text;
-};
-
-/** رسالة عربية موحّدة لأخطاء الاتصال بالخادم */
-const describeServerError = (err: any): string => {
-  if (err?.name === 'AbortError') {
-    return 'الشبكة بطيئة ولم يكتمل الإرسال خلال ٢٠ ثانية. لم يُحفظ شيء — انتقل لمكان بتغطية أفضل وحاول مجدداً.';
-  }
-  if (err?.message === 'SERVER_404') {
-    return 'رابط الشركة غير صحيح أو تم حذفه من السيرفر (404). راجع المسؤول.';
-  }
-  if (err?.message === 'INVALID_RESPONSE') {
-    return 'الرابط المسجل لا يؤدي إلى كود النظام. راجع المسؤول.';
-  }
-  return 'تعذّر الاتصال بالخادم. تأكد من الإنترنت وحاول مجدداً.';
-};
-
 interface LoginProps {
   onLogin: (user: User) => void;
-  allUsers: User[];
   adminConfig: AppConfig;
   availableJobs: Job[];
   branches: Branch[];
@@ -85,18 +19,20 @@ interface LoginProps {
   onSync?: (url: string, force?: boolean, timeoutMs?: number) => Promise<any | null>;
   /** يفتح شاشة التقارير كصفحة مستقلة أو داخلية */
   onOpenReports?: () => void;
+  /** رسالة تظهر أعلى الشاشة — مثل «انتهت جلسة الدخول» */
+  notice?: string;
 }
 
 export default function Login({ 
   onLogin, 
-  allUsers, 
   adminConfig, 
   availableJobs, 
   branches, 
   setAdminConfig,
   logAction,
   onSync,
-  onOpenReports
+  onOpenReports,
+  notice
 }: LoginProps) {
   const [mode, setMode] = useState<'register' | 'login' | 'admin' | 'reports'>('login');
   const [isReportsLoggedIn, setIsReportsLoggedIn] = useState(false);
@@ -110,9 +46,11 @@ export default function Login({
   // «تذكرني»: تُملأ بيانات المسؤول المحفوظة على هذا الجهاز تلقائياً
   const [savedAdmin] = useState(() => getSavedLogin('admin'));
   const [adminUsername, setAdminUsername] = useState(savedAdmin?.user || '');
-  const [adminPassword, setAdminPassword] = useState(savedAdmin?.pass || '');
+  // كلمة المرور لا تُحفظ — المحفوظ جلسة. خانة فارغة + جلسة محفوظة = دخول بالجلسة
+  const [adminPassword, setAdminPassword] = useState('');
   const [rememberAdmin, setRememberAdmin] = useState(!!savedAdmin);
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showRegPassword, setShowRegPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
@@ -218,9 +156,6 @@ export default function Login({
       if (text.includes('Password Reset Successfully')) {
         setRecSuccess('تم تغيير كلمة المرور بنجاح. يمكنك الدخول بها الآن.');
         logAction('نجاح استعادة كلمة المرور', `الموظف: ${recVerifiedName}`);
-        // مزامنة فورية بالرابط الصحيح: النسخة المحلية ما زالت تحمل كلمة
-        // المرور القديمة، فبدونها يفشل الدخول بالجديدة حتى إعادة فتح التطبيق.
-        await onSync?.(adminConfig.syncUrl, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
         setNationalId(recNationalId.trim());
         setTimeout(closeRecovery, 2200);
       } else {
@@ -239,6 +174,7 @@ export default function Login({
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
     
     if (!navigator.onLine) {
       setError('عذراً، لا يمكن إتمام عملية التسجيل والجهاز غير متصل بالإنترنت.');
@@ -248,335 +184,159 @@ export default function Login({
 
     if (!fullName || !nationalId || !password || !confirmPassword || !selectedJob || !defaultBranch) {
       setError('يرجى إكمال جميع البيانات واختيار الوظيفة والفرع الأساسي');
-      logAction('فشل تسجيل مستخدم جديد', 'السبب: بيانات ناقصة');
       return;
     }
-
     if (password !== confirmPassword) {
       setError('كلمة المرور وتأكيد كلمة المرور غير متطابقين');
-      logAction('فشل تسجيل مستخدم جديد', 'السبب: عدم تطابق كلمة المرور وتأكيدها');
       return;
     }
-    
     if (nationalId.length !== 14) {
       setError('الرقم القومي يجب أن يكون 14 رقماً');
-      logAction('فشل تسجيل مستخدم جديد', `السبب: طول الرقم القومي غير صحيح (${nationalId.length})`);
       return;
     }
-    
     if (password.length < 6) {
       setError('كلمة المرور يجب ألا تقل عن 6 أرقام/حروف');
-      logAction('فشل تسجيل مستخدم جديد', 'السبب: كلمة المرور قصيرة جداً');
       return;
     }
-
     if (password.startsWith('0')) {
       setError('كلمة المرور لا يمكن أن تبدأ بالرقم صفر (0) أو تكون أصفاراً فقط .');
-      logAction('فشل تسجيل مستخدم جديد', 'السبب: كلمة المرور تبدأ بصفر');
-      return;
-    }
-    
-    const deviceId = getDeviceFingerprint();
-
-    const existingById = allUsers.find(u => u.nationalId === nationalId);
-    if (existingById) {
-      setError('عذراً، هذا الرقم القومي مسجل مسبقاً في النظام.');
-      logAction('فشل تسجيل مستخدم جديد', `السبب: الرقم القومي مسجل مسبقاً (${nationalId})`);
       return;
     }
 
-    // Check if device is already registered to another user (strictly)
-    // Note: With multi-device support, a device ideally shouldn't be shared, but strictness can be relaxed if needed.
-    // Here we keep it strict: One device = One User identity.
-    const deviceOwner = allUsers.find(u => 
-      u.deviceId === deviceId || (u.deviceIds && u.deviceIds.includes(deviceId))
-    );
-    if (deviceOwner) {
-      setError(`عذراً، هذا الهاتف مرتبط بالفعل بحساب موظف آخر (${deviceOwner.fullName}).`);
-      logAction('فشل تسجيل مستخدم جديد', `السبب: الهاتف مرتبط بموظف آخر (${deviceOwner.fullName})`);
-      return;
-    }
-
-    setIsLoading(true);
-
-    const branchObj = branches.find(b => b.id === defaultBranch);
-    const branchNameForSheet = branchObj ? branchObj.name : defaultBranch;
-
-    const newUser: User = {
-      id: Math.random().toString(36).substr(2, 9),
-      fullName,
-      nationalId,
-      password,
-      role: 'employee',
-      deviceId: deviceId, // Legacy
-      deviceIds: [deviceId], // New
-      allowedDeviceCount: 1, // Default
-      jobTitle: selectedJob,
-      defaultBranchId: branchNameForSheet,
-      registrationDate: new Date().toISOString()
-    };
-
-    // بلا رابط سحابة لا وجود لحساب أصلاً — الدخول محلياً يوهم الموظف
-    // بأنه سجّل، ثم يكتشف بعد أيام أن اسمه ليس في النظام.
-    if (!adminConfig.googleSheetLink) {
-      setIsLoading(false);
+    // بلا رابط سحابة لا وجود لحساب أصلاً
+    const url = adminConfig.googleSheetLink || adminConfig.syncUrl;
+    if (!url) {
       setError('التطبيق غير مربوط بالسحابة، ولا يمكن إنشاء حساب الآن. راجع المسؤول.');
-      logAction('فشل تسجيل مستخدم جديد', 'السبب: التطبيق غير مربوط بالسحابة');
       return;
     }
 
-    let serverReply = '';
+    // كل الشروط (تكرار الرقم القومي، الجهاز المربوط بموظف آخر، الوظيفة والفرع)
+    // يفحصها الخادم — التطبيق لم يعد يملك قائمة الموظفين.
+    const branchObj = branches.find(b => b.id === defaultBranch);
+    setIsLoading(true);
+    let res: any;
     try {
-      serverReply = await postToServer(adminConfig.googleSheetLink, {
+      res = await postJson(url, {
         action: 'registerUser',
-        ...newUser,
-        timestamp: newUser.registrationDate
+        fullName: fullName.trim(),
+        nationalId,
+        password,
+        jobTitle: selectedJob,
+        defaultBranchId: branchObj ? branchObj.name : defaultBranch,
+        deviceId: getDeviceFingerprint()
       });
     } catch (err: any) {
       setIsLoading(false);
-      const msg = describeServerError(err);
+      const msg = describeNetError(err);
       setError('لم يُنشأ الحساب. ' + msg);
-      logAction('فشل تسجيل مستخدم جديد', `السبب: ${msg} | ${err?.message || ''}`);
+      logAction('فشل تسجيل مستخدم جديد', `السبب: ${msg}`);
       return;
     }
-
-    // الخادم يردّ "User Registered Successfully" عند النجاح وحده.
-    // التحقق بوجود نصّ النجاح لا بغياب كلمة خطأ — فبعض ردود الرفض
-    // تأتي بلا بادئة Error (مثل "User Not Found" في إجراءات أخرى).
-    if (!serverReply.includes('User Registered Successfully')) {
-      setIsLoading(false);
-      const reason = serverReply.replace(/^Error:\s*/, '');
-      setError(
-        serverReply.includes('National ID Already Registered')
-          ? 'هذا الرقم القومي مسجل مسبقاً في النظام. جرّب الدخول بدل إنشاء حساب.'
-          : 'لم يُنشأ الحساب: ' + reason
-      );
-      logAction('فشل تسجيل مستخدم جديد', `رفض الخادم: ${serverReply}`);
-      return;
-    }
-
-    logAction('تسجيل مستخدم جديد', `الموظف: ${fullName}, الوظيفة: ${selectedJob}`);
-
-    // الخادم يولّد الرقم التسلسلي بنفسه ولا يُعيده في الردّ، فالنسخة
-    // المحلية تخرج بلا serialNumber — يظهر «SN: ---» ويُرسل فارغاً مع أول
-    // تسجيل حضور. المزامنة هنا تجلب النسخة الكاملة من الشيت.
-    let userToLogin: User = newUser;
-    if (onSync) {
-      try {
-        const synced = await onSync(adminConfig.googleSheetLink, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
-        if (synced && Array.isArray(synced.users)) {
-          const fresh = synced.users.find(
-            (u: User) => String(u.nationalId).trim() === String(newUser.nationalId).trim()
-          );
-          if (fresh) userToLogin = fresh;
-        }
-      } catch (err) {
-        // الحساب حُفظ فعلاً — فشل المزامنة لا يمنع الدخول،
-        // والمزامنة الدورية ستُكمل الرقم التسلسلي خلال دقائق.
-        console.warn('Post-registration sync notice:', err);
-      }
-    }
-
     setIsLoading(false);
-    onLogin(userToLogin);
+
+    if (!res || !res.ok) {
+      setError('لم يُنشأ الحساب: ' + ((res && res.error) || 'ردّ غير متوقع من الخادم.'));
+      logAction('فشل تسجيل مستخدم جديد', `رفض الخادم: ${(res && res.error) || ''}`);
+      return;
+    }
+
+    logAction('تسجيل مستخدم جديد', `الموظف: ${fullName}, الوظيفة: ${selectedJob}${res.pending ? ' (بانتظار الموافقة)' : ''}`);
+
+    if (res.pending) {
+      // وضع «التسجيل بموافقة المسؤول»: الحساب أُنشئ ولا يعمل حتى يقبله
+      setPassword(''); setConfirmPassword('');
+      setMode('login');
+      setInfo('تم إنشاء حسابك وهو بانتظار موافقة المسؤول. ادخل بعد قبوله بنفس الرقم القومي وكلمة المرور.');
+      return;
+    }
+
+    setEmployeeToken(res.token);
+    onLogin({ ...res.user, role: 'employee' });
   };
 
   const handleEmployeeLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(''); setInfo('');
 
     if (!navigator.onLine) {
       setError('عذراً، لا يمكن تسجيل الدخول والجهاز غير متصل بالإنترنت.');
-      logAction('فشل تسجيل دخول موظف', 'السبب: الجهاز غير متصل بالإنترنت');
       return;
     }
-
-    setIsLoading(true);
-    setError('');
-
-    let currentUsersList = allUsers;
-    const syncTargetUrl = adminConfig.syncUrl || adminConfig.googleSheetLink;
-
-    // 1. المزامنة المباشرة مع شيت جوجل قبل التحقق من بيانات الدخول.
-    //    بمهلة: على شبكة ضعيفة — لا منقطعة — كان الطلب يعلّق بلا نهاية
-    //    فيتجمّد زر الدخول. عند انتهاء المهلة نُكمل بالقائمة المحلية.
-    if (onSync && syncTargetUrl) {
-      try {
-        const syncedData = await onSync(syncTargetUrl, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
-        if (syncedData && Array.isArray(syncedData.users)) {
-          currentUsersList = syncedData.users;
-        }
-      } catch (err) {
-        console.warn('Pre-login sync notice:', err);
-      }
-    }
-
-    if (currentUsersList.length === 0 && syncTargetUrl) {
-      setError('تعذر جلب بيانات الموظفين من السيرفر، يرجى التأكد من الاتصال بالإنترنت ومحاولة الدخول مجدداً.');
-      logAction('فشل تسجيل دخول موظف', 'السبب: تعذر جلب بيانات الموظفين');
-      setIsLoading(false);
+    const url = adminConfig.syncUrl || adminConfig.googleSheetLink;
+    if (!url) {
+      setError('التطبيق غير مربوط بالسحابة. راجع المسؤول.');
       return;
     }
-
     const trimmedNId = nationalId.trim();
-    const trimmedPass = password.trim();
-
-    const user = currentUsersList.find(u => 
-      String(u.nationalId).trim() === trimmedNId && 
-      String(u.password).trim() === trimmedPass
-    );
-    
-    if (user) {
-      const currentDeviceId = getDeviceFingerprint();
-      
-      // Check if this device belongs to someone else
-      const otherDeviceOwner = currentUsersList.find(u => 
-        u.id !== user.id && 
-        String(u.nationalId).trim() !== trimmedNId &&
-        ((u.deviceId === currentDeviceId) || (u.deviceIds && u.deviceIds.includes(currentDeviceId)))
-      );
-      
-      if (otherDeviceOwner) {
-        setError(`عذراً، هذا الهاتف مسجل باسم موظف آخر (${otherDeviceOwner.fullName}).`);
-        logAction('فشل تسجيل دخول موظف', `السبب: الهاتف مسجل باسم موظف آخر (${otherDeviceOwner.fullName})`);
-        setIsLoading(false);
-        return;
-      }
-
-      // Logic for Multi-Device Support
-      const userDevices = Array.isArray(user.deviceIds) ? user.deviceIds : (user.deviceId ? [user.deviceId] : []);
-      const maxDevices = user.allowedDeviceCount || 1;
-
-      if (userDevices.includes(currentDeviceId)) {
-        // Device is already linked -> Allow Login
-        setIsLoading(false);
-        logAction('تسجيل دخول موظف', `الموظف: ${user.fullName}, الرقم القومي: ${user.nationalId}`);
-        onLogin(user);
-      } else {
-        // Device not linked, check if we can add it
-        if (userDevices.length < maxDevices) {
-          // Add new device
-          const updatedDevices = [...userDevices, currentDeviceId];
-          const updatedUser = { 
-            ...user, 
-            deviceIds: updatedDevices,
-            deviceId: currentDeviceId
-          };
-          
-          // ربط الجهاز يجب أن يُثبت على الخادم قبل الدخول.
-          // كان الفشل يُبتلع ثم يُسجَّل «ربط جهاز جديد» في سجلّ التدقيق
-          // ويُدخل الموظف — فيناقض السجلُّ الشيتَ، ويظنّ الموظف أن جهازه
-          // مربوط بينما حصّته من الأجهزة لم تُستهلك أصلاً على الخادم.
-          if (!syncTargetUrl) {
-            setIsLoading(false);
-            setError('التطبيق غير مربوط بالسحابة، ولا يمكن ربط هذا الجهاز الآن. راجع المسؤول.');
-            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, السبب: لا يوجد رابط سحابة`);
-            return;
-          }
-
-          let deviceReply = '';
-          try {
-            deviceReply = await postToServer(syncTargetUrl, {
-              action: 'updateUserDevice',
-              nationalId: updatedUser.nationalId,
-              userId: updatedUser.id,
-              deviceIds: updatedDevices
-            });
-          } catch (err: any) {
-            setIsLoading(false);
-            const msg = describeServerError(err);
-            setError('لم يُربط هذا الجهاز بحسابك. ' + msg);
-            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, الجهاز: ${currentDeviceId} | ${msg}`);
-            return;
-          }
-
-          // الخادم يردّ "Device Updated" عند النجاح وحده.
-          // انتبه: ردّ الرفض "User Not Found" يأتي بلا بادئة Error،
-          // فلا يصحّ التحقق بغياب كلمة خطأ.
-          if (!deviceReply.includes('Device Updated')) {
-            setIsLoading(false);
-            setError(
-              deviceReply.includes('User Not Found')
-                ? 'لم يُعثر على حسابك في السجلّ السحابي. راجع المسؤول.'
-                : 'لم يُربط هذا الجهاز بحسابك: ' + deviceReply.replace(/^Error:\s*/, '')
-            );
-            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, رفض الخادم: ${deviceReply}`);
-            return;
-          }
-
-          // الربط تأكّد على الخادم. المزامنة بعده تحديثٌ للحالة لا شرطٌ
-          // للدخول، ففشلها على شبكة ضعيفة لا يبرّر منع موظف رُبط جهازه فعلاً.
-          let userToLogin: User = updatedUser;
-          if (onSync) {
-            try {
-              const refreshedData = await onSync(syncTargetUrl, true, DEVICE_LINK_SYNC_TIMEOUT_MS);
-              if (refreshedData && Array.isArray(refreshedData.users)) {
-                const refreshedUser = refreshedData.users.find((u: User) =>
-                  String(u.nationalId).trim() === String(updatedUser.nationalId).trim()
-                );
-                if (refreshedUser) userToLogin = refreshedUser;
-              }
-            } catch (err) {
-              console.warn('Post device-link sync notice:', err);
-            }
-          }
-
-          setIsLoading(false);
-          logAction('تسجيل دخول موظف (ربط جهاز جديد)', `الموظف: ${userToLogin.fullName}, الجهاز: ${currentDeviceId}`);
-          onLogin(userToLogin);
-        } else {
-          // Limit reached
-          setIsLoading(false);
-          logAction('فشل تسجيل دخول (تجاوز عدد الأجهزة)', `الموظف: ${user.fullName}, الجهاز: ${currentDeviceId}`);
-          setError(`عذراً، لقد تجاوزت الحد المسموح من الأجهزة (${userDevices.length}/${maxDevices}). يرجى التواصل مع المسؤول.`);
-        }
-      }
-    } else {
-      setIsLoading(false);
-      logAction('فشل تسجيل دخول موظف', `الرقم القومي: ${nationalId}`);
-      setError('بيانات الدخول غير صحيحة، تأكد من الرقم القومي وكلمة المرور.');
+    if (!trimmedNId || !password.trim()) {
+      setError('اكتب الرقم القومي وكلمة المرور.');
+      return;
     }
+
+    // التحقق كله في الخادم: كلمة المرور، الجهاز المربوط بموظف آخر، حدّ الأجهزة،
+    // وربط هذا الجهاز إن كان في حصّة الموظف مكان.
+    setIsLoading(true);
+    let res: any;
+    try {
+      res = await postJson(url, {
+        action: 'loginEmployee',
+        nationalId: trimmedNId,
+        password: password.trim(),
+        deviceId: getDeviceFingerprint()
+      });
+    } catch (err: any) {
+      setIsLoading(false);
+      setError(describeNetError(err));
+      logAction('فشل تسجيل دخول موظف', `الرقم القومي: ${trimmedNId} | ${err?.message || ''}`);
+      return;
+    }
+    setIsLoading(false);
+
+    if (!res || !res.ok || !res.token) {
+      setError((res && res.error) || 'بيانات الدخول غير صحيحة، تأكد من الرقم القومي وكلمة المرور.');
+      logAction('فشل تسجيل دخول موظف', `الرقم القومي: ${trimmedNId} | ${(res && res.error) || ''}`);
+      return;
+    }
+
+    setEmployeeToken(res.token);
+    const user: User = { ...res.user, role: 'employee' };
+    logAction(res.newDevice ? 'تسجيل دخول موظف (ربط جهاز جديد)' : 'تسجيل دخول موظف',
+      `الموظف: ${user.fullName}${res.newDevice ? ', الجهاز: ' + getDeviceFingerprint() : ''}`);
+    onLogin(user);
   };
 
   const handleAdminSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsLoading(true);
     setError('');
 
     const user = adminUsername.trim();
     const pass = adminPassword.trim();
-    
-    // Check strictly against configured Admin credentials (SSOT)
-    const isAdminValid = user === adminConfig.adminUsername && pass === adminConfig.adminPassword;
+    const url = adminConfig.syncUrl || adminConfig.googleSheetLink;
+    if (!url) { setError('التطبيق غير مربوط بالسحابة. راجع المسؤول.'); return; }
+    // بلا كلمة مرور: الدخول بالجلسة المحفوظة («تذكرني») إن كانت لنفس الاسم
+    const useSaved = !pass && savedAdmin?.token && savedAdmin.user === user;
+    if (!user || (!pass && !useSaved)) { setError('اكتب اسم المستخدم وكلمة المرور.'); return; }
 
-    if (!isAdminValid) {
-      logAction('فشل تسجيل دخول مسؤول', `حساب غير مصرح له كمسؤول: ${user}`);
-      setError('بيانات دخول المسؤول غير صحيحة. يرجى إدخال اسم المستخدم وكلمة المرور الخاصة بالإدارة فقط.');
-      setIsLoading(false);
+    setIsLoading(true);
+    const res = await loginApprover(url, useSaved ? { token: savedAdmin!.token } : { user, pass });
+    setIsLoading(false);
+
+    if (!res.ok || !res.token || !res.isAdmin) {
+      if (useSaved && !res.network) clearSavedLogin('admin');
+      logAction('فشل تسجيل دخول مسؤول', `الحساب: ${user}`);
+      setError(res.network ? (res.error || 'تعذّر الاتصال بالخادم.')
+        : res.ok ? 'هذا الحساب ليس حساب المسؤول.'
+        : useSaved ? 'انتهت الجلسة المحفوظة. اكتب كلمة المرور.'
+        : (res.error || 'بيانات دخول المسؤول غير صحيحة.'));
       return;
     }
 
-    // Optional cloud check if syncUrl is available to confirm cloud status for admin
-    if (adminConfig.syncUrl) {
-      try {
-        const response = await fetch(`${adminConfig.syncUrl}?action=getReportData&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}`);
-        const data = await response.json();
-        
-        if (data.error) {
-          logAction('فشل تسجيل دخول مسؤول (سحابي)', `المسؤول: ${user}`);
-          setError('بيانات الدخول غير صحيحة أو تم رفضها من الخادم السحابي.');
-          setIsLoading(false);
-          return;
-        }
-      } catch (err) {
-        console.warn("Cloud admin check warning", err);
-      }
-    }
-
-    if (rememberAdmin) setSavedLogin('admin', user, pass);
+    setApproverSession({ token: res.token, user, isAdmin: true });
+    if (rememberAdmin) setSavedLogin('admin', user, res.token);
     else clearSavedLogin('admin');
+    setAdminPassword('');
     logAction('تسجيل دخول مسؤول', `المسؤول: ${user}`);
     onLogin({ id: 'admin-id', fullName: 'المسؤول', nationalId: '000', role: 'admin' });
-    setIsLoading(false);
   };
 
   const inputClasses = "w-full px-4 py-3.5 rounded-2xl border border-slate-600 bg-slate-900 text-white placeholder:text-slate-500 font-bold outline-none focus:border-blue-500 transition-all shadow-inner";
@@ -697,6 +457,13 @@ export default function Login({
           {!navigator.onLine && (
             <div className="mb-4 p-3 bg-red-900/30 border border-red-500/50 rounded-2xl flex items-center gap-3 text-red-400 text-[11px] font-black">
               <WifiOff size={16} /> الهاتف غير متصل بالإنترنت
+            </div>
+          )}
+
+          {(info || (notice && !error)) && (
+            <div className="mb-4 p-4 bg-amber-900/20 border-r-4 border-amber-500 rounded-xl text-amber-300 text-xs font-bold flex gap-2 items-start">
+              <AlertCircle size={16} className="shrink-0 mt-0.5" />
+              <span>{info || notice}</span>
             </div>
           )}
 
@@ -859,7 +626,7 @@ export default function Login({
             <form onSubmit={handleAdminSubmit} className="space-y-4">
               <input type="text" placeholder="اسم مستخدم المسؤول" value={adminUsername} onChange={e => setAdminUsername(e.target.value)} className={inputClasses} />
               <div className="relative">
-                <input type={showAdminPassword ? 'text' : 'password'} placeholder="كلمة مرور المسؤول" value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className={`${inputClasses} pl-12`} />
+                <input type={showAdminPassword ? 'text' : 'password'} placeholder={savedAdmin?.token && savedAdmin.user === adminUsername.trim() ? 'محفوظة على هذا الجهاز — اضغط دخول' : 'كلمة مرور المسؤول'} value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className={`${inputClasses} pl-12`} />
                 <button type="button" onClick={() => setShowAdminPassword(!showAdminPassword)} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition-colors">
                   {showAdminPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                 </button>

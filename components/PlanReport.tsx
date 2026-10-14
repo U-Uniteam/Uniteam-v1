@@ -11,7 +11,7 @@ import { postRequestAction, todayIso, monthOf, lastDayOfMonth, addDaysIso, weekd
 
 interface Entry { userId: string; date: string; branchName: string; source: 'plan' | 'leave' | 'manual'; status: 'approved' | 'pending'; reason?: string }
 interface Emp { id: string; userName: string; jobTitle: string; serialNumber: string; defaultBranch?: string }
-interface Props { syncUrl: string; approverUser: string; approverPass: string }
+interface Props { syncUrl: string; approverToken: string }
 
 interface Cell { text: string; kind: 'plan' | 'manual' | 'leave' | 'pending' | 'mixed' }
 
@@ -55,7 +55,7 @@ function buildCell(list: Entry[]): Cell | null {
   return { text: names.join(' / ') + ' (معلّق)', kind: 'pending' };
 }
 
-export default function PlanReport({ syncUrl, approverUser, approverPass }: Props) {
+export default function PlanReport({ syncUrl, approverToken }: Props) {
   const today = todayIso();
   const [from, setFrom] = useState(`${monthOf(today)}-01`);
   const [to, setTo] = useState(lastDayOfMonth(monthOf(today)));
@@ -102,7 +102,7 @@ export default function PlanReport({ syncUrl, approverUser, approverPass }: Prop
 
   const load = async () => {
     setError(''); setLoading(true);
-    const res: any = await postRequestAction(syncUrl, { action: 'getPlanReport', approverUser, approverPass, from, to });
+    const res: any = await postRequestAction(syncUrl, { action: 'getPlanReport', approverToken, from, to });
     setLoading(false);
     if (!res.ok) { setError(res.error || 'تعذّر إنشاء التقرير'); return; }
     setData({ entries: res.entries || [], employees: res.employees || [], from: res.from, to: res.to });

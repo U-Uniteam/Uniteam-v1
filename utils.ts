@@ -406,12 +406,13 @@ export function getEgyptTime(dateInput?: Date | number | string): Date {
 
 
 // ---------------- «تذكرني على هذا الجهاز» ----------------
-// بيانات الدخول المحفوظة للمسؤول وحسابات التقارير.
-// تُحفظ على الجهاز نفسه فقط، وبترميز يمنع قراءتها بالعين لا تشفيراً حقيقياً.
-// لا تُحفظ إلا إذا اختار المستخدم «تذكرني»، وإلغاء الخانة يمسحها فوراً.
+// جلسة المسؤول وحسابات التقارير المحفوظة على هذا الجهاز.
+// منذ التحديث الأمني تُحفظ «الجلسة» الموقّعة من الخادم لا كلمة المرور نفسها:
+// لا تصلح إلا لهذا التطبيق، تنتهي وحدها، وتسقط فور تغيير كلمة المرور.
+// القيم القديمة التي تحمل كلمة مرور (pass) تُقرأ مرة واحدة لتُستبدل بجلسة.
 
 export type SavedLoginKind = 'admin' | 'reports';
-export interface SavedLogin { user: string; pass: string }
+export interface SavedLogin { user: string; pass?: string; token?: string }
 
 const SAVED_LOGIN_PREFIX = 'uniteam_saved_login_';
 
@@ -421,7 +422,7 @@ const encodeLogin = (v: SavedLogin): string =>
 const decodeLogin = (s: string): SavedLogin | null => {
   try {
     const v = JSON.parse(decodeURIComponent(escape(atob(s.split('').reverse().join('')))));
-    if (v && typeof v.user === 'string' && typeof v.pass === 'string' && v.user && v.pass) return v;
+    if (v && typeof v.user === 'string' && v.user && (typeof v.token === 'string' && v.token || typeof v.pass === 'string' && v.pass)) return v;
   } catch (e) { /* قيمة تالفة */ }
   return null;
 };
@@ -433,8 +434,9 @@ export const getSavedLogin = (kind: SavedLoginKind): SavedLogin | null => {
   } catch (e) { return null; }
 };
 
-export const setSavedLogin = (kind: SavedLoginKind, user: string, pass: string): void => {
-  try { localStorage.setItem(SAVED_LOGIN_PREFIX + kind, encodeLogin({ user, pass })); } catch (e) { /* التخزين محجوب */ }
+/** يحفظ اسم المستخدم والجلسة فقط — لا كلمة مرور */
+export const setSavedLogin = (kind: SavedLoginKind, user: string, token: string): void => {
+  try { localStorage.setItem(SAVED_LOGIN_PREFIX + kind, encodeLogin({ user, token })); } catch (e) { /* التخزين محجوب */ }
 };
 
 export const clearSavedLogin = (kind: SavedLoginKind): void => {

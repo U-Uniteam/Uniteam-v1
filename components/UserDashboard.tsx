@@ -3,7 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { User, Branch, AttendanceRecord, VisitPlan, Job, StaffRequest } from '../types';
 import { MapPin, Clock, CheckCircle, AlertCircle, RotateCcw, RefreshCw, Cloud, FileText, Navigation, Calendar, Inbox, Fingerprint } from 'lucide-react';
 import { LazyRequestsPanel, ScreenLoader } from './LazyScreens';
-import { postRequestAction, employeeAuth, unseenDecisions } from './requestsApi';
+import { postRequestAction, employeeAuth, unseenDecisions, signalSessionExpired } from './requestsApi';
+import { getClientSource } from './session';
 import { notifyEmployeeDecisions, clearDesktopBadge } from './desktopNotify';
 import { calculateDistance, getDeviceFingerprint, getEgyptTime, getRealNetworkTime, checkDeveloperOptionsStatus, checkMockLocationStatus } from '../utils';
 
@@ -69,6 +70,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     setReqLoading(true); setReqError('');
     const res = await postRequestAction(googleSheetLink, { action: 'getMyRequests', ...employeeAuth(user.nationalId) });
     setReqLoading(false);
+    if (res.authExpired) { signalSessionExpired(res.error); return; }
     if (!res.ok) { setReqError(res.error || 'تعذّر تحميل الطلبات'); return; }
     const list = res.requests || [];
     setMyRequests(list);
@@ -83,6 +85,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   silentCheckRef.current = async () => {
     if (!googleSheetLink || !navigator.onLine) return;
     const res = await postRequestAction(googleSheetLink, { action: 'getMyRequests', ...employeeAuth(user.nationalId) });
+    if (res.authExpired) { signalSessionExpired(res.error); return; }
     if (!res.ok) return;
     const list = res.requests || [];
     setMyRequests(list);
@@ -574,12 +577,14 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         // المهلة ليست ترفاً: الشبكة **الضعيفة** — لا المنقطعة — لا تُطلق
         // خطأً أبداً، فيبقى الطلب معلّقاً وزر التسجيل معطّلاً بلا نهاية،
         // والموظف واقف في الشارع لا يدري أنجح تسجيله أم لا.
+        // الهوية = الجلسة الموقّعة. الاسم والوظيفة وفرق الوقت يقرأها الخادم من
+        // شيت الموظفين بنفسه؛ ما يُرسل هنا للعرض فقط. المصدر يظهر في التقارير.
         const payload = JSON.stringify({
           action: 'saveAttendance',
           ...newRecord,
-          nationalId: user.nationalId,
+          ...employeeAuth(user.nationalId),
           serialNumber: user.serialNumber,
-          deviceId: getDeviceFingerprint()
+          source: getClientSource()
         });
 
         const postOnce = async (): Promise<Response> => {
@@ -637,6 +642,16 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         // B) Check content validity (Avoid HTML/Google Login pages)
         if (!responseText || responseText.trim().startsWith("<")) {
            throw new Error("INVALID_RESPONSE_FORMAT");
+        }
+
+        // الجلسة انتهت (صفّر المسؤول الأجهزة أو حذف الحساب): رسالة واضحة ثم خروج
+        if (responseText.includes("SESSION_EXPIRED")) {
+           const msg = responseText.replace(/^Error:\s*SESSION_EXPIRED\s*/, '');
+           logAction(`فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} (جلسة منتهية)`, msg);
+           setStatus({ type: 'error', msg });
+           setIsVerifying(false);
+           setTimeout(() => signalSessionExpired(msg), 2500);
+           return;
         }
 
         // C) Logic Validation

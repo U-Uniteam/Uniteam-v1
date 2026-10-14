@@ -1,4 +1,5 @@
 import { getEgyptTime, getDeviceFingerprint, getRealNetworkTime } from '../utils';
+import { getEmployeeToken } from './session';
 import type { StaffRequest, RequestStatus, PlanDay, LeaveDetails, Job } from '../types';
 
 /**
@@ -16,6 +17,8 @@ export interface ApiResult {
   today?: string;
   canPlan?: boolean;
   approver?: string;
+  /** الجلسة انتهت أو أُلغيت — يلزم الدخول مجدداً */
+  authExpired?: boolean;
 }
 
 /** إرسال إجراء طلبات وقراءة ردّ JSON — الأخطاء تعود رسالة عربية جاهزة للعرض */
@@ -56,9 +59,17 @@ export async function postRequestAction(url: string, payload: Record<string, any
   }
 }
 
-/** طلبات الموظف الحالي — هويته بالرقم القومي والجهاز المربوط */
+/**
+ * هوية الموظف الحالي لطلبات الخادم: الجلسة الموقّعة. الرقم القومي والجهاز
+ * يرافقانها احتياطاً فقط — يقبلهما الخادم خلال فترة الانتقال وحدها.
+ */
 export function employeeAuth(nationalId: string) {
-  return { nationalId, deviceId: getDeviceFingerprint() };
+  return { token: getEmployeeToken(), nationalId, deviceId: getDeviceFingerprint() };
+}
+
+/** الجلسة المفتوحة على التطبيق انتهت — App.tsx يُخرج المستخدم إلى شاشة الدخول */
+export function signalSessionExpired(message?: string) {
+  try { window.dispatchEvent(new CustomEvent('uniteam:session-expired', { detail: message || '' })); } catch (e) { /* بيئة بلا نوافذ */ }
 }
 
 // ---------------- التاريخ ----------------

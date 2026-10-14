@@ -10,23 +10,23 @@ import { postRequestAction } from './requestsApi';
  * Start في تليجرام ← «تأكيد الربط». الخادم: handleTelegramAction في google-apps-script.js
  */
 
-interface Props { syncUrl: string; approverUser: string; approverPass: string }
+interface Props { syncUrl: string; approverToken: string }
 
 interface Status { configured: boolean; allowed: boolean; linked: boolean; telegramName?: string; bot?: string }
 
-export default function TelegramLink({ syncUrl, approverUser, approverPass }: Props) {
+export default function TelegramLink({ syncUrl, approverToken }: Props) {
   const [status, setStatus] = useState<Status | null>(null);
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState<'' | 'start' | 'confirm' | 'unlink'>('');
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
-  const auth = { approverUser, approverPass };
+  const auth = { approverToken };
 
   const load = useCallback(async () => {
-    if (!syncUrl || !approverUser || !approverPass) return;
+    if (!syncUrl || !approverToken) return;
     const res: any = await postRequestAction(syncUrl, { action: 'telegramStatus', ...auth });
     if (res.ok) setStatus(res as Status);
-  }, [syncUrl, approverUser, approverPass]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [syncUrl, approverToken]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { load(); }, [load]);
 

@@ -1,5 +1,6 @@
 import { postRequestAction } from './requestsApi';
-import { getSavedLogin, isDesktopApp, desktopInvoke, SavedLogin } from '../utils';
+import { getSavedLogin, setSavedLogin, clearSavedLogin, isDesktopApp, desktopInvoke, SavedLoginKind } from '../utils';
+import { loginApprover } from './session';
 import type { StaffRequest, LeaveDetails } from '../types';
 
 /**
@@ -17,17 +18,38 @@ const POLL_MS = 2 * 60 * 1000;
 const FIRST_DELAY_MS = 15 * 1000;
 const SEEN_KEY = 'uniteam_notified_requests';
 
-let sessionApprover: SavedLogin | null = null;
+interface ApproverCred { user: string; token: string }
+let sessionApprover: ApproverCred | null = null;
 
-/** يُستدعى عند دخول حساب تقارير/مسؤول وعند خروجه */
-export const setSessionApprover = (c: SavedLogin | null): void => {
-  sessionApprover = c && c.user && c.pass ? { user: c.user, pass: c.pass } : null;
+/** يُستدعى عند دخول حساب تقارير/مسؤول وعند خروجه — الجلسة لا كلمة المرور */
+export const setSessionApprover = (c: { user: string; token: string } | null): void => {
+  sessionApprover = c && c.user && c.token ? { user: c.user, token: c.token } : null;
 };
 
-const credentials = (): SavedLogin[] => {
-  const all = [sessionApprover, getSavedLogin('reports'), getSavedLogin('admin')];
-  const out: SavedLogin[] = [];
-  all.forEach(c => { if (c && !out.some(x => x.user === c.user && x.pass === c.pass)) out.push(c); });
+const RENEW_MS = 6 * 60 * 60 * 1000;
+const lastRenew: Record<string, number> = {};
+
+/**
+ * جلسات «تذكرني» المحفوظة: القديمة التي تحمل كلمة مرور تُستبدل بجلسة مرة واحدة،
+ * والجلسات تُجدَّد كل بضع ساعات حتى لا تنتهي ما دام التطبيق يعمل.
+ */
+const savedCred = async (url: string, kind: SavedLoginKind): Promise<ApproverCred | null> => {
+  const saved = getSavedLogin(kind);
+  if (!saved) return null;
+  const due = !saved.token || Date.now() - (lastRenew[kind] || 0) > RENEW_MS;
+  if (!due) return { user: saved.user, token: saved.token! };
+  const r = await loginApprover(url, saved.token ? { token: saved.token } : { user: saved.user, pass: saved.pass });
+  if (r.network) return saved.token ? { user: saved.user, token: saved.token } : null;
+  if (!r.ok || !r.token) { clearSavedLogin(kind); return null; }
+  lastRenew[kind] = Date.now();
+  if (r.token !== saved.token) setSavedLogin(kind, saved.user, r.token);
+  return { user: saved.user, token: r.token };
+};
+
+const credentials = async (url: string): Promise<ApproverCred[]> => {
+  const all = [sessionApprover, await savedCred(url, 'reports'), await savedCred(url, 'admin')];
+  const out: ApproverCred[] = [];
+  all.forEach(c => { if (c && !out.some(x => x.token === c.token)) out.push(c); });
   return out;
 };
 
@@ -76,7 +98,7 @@ export function startDesktopNotifier(getSyncUrl: () => string): () => void {
     running = true;
     try {
       const url = getSyncUrl();
-      const creds = credentials();
+      const creds = url && navigator.onLine ? await credentials(url) : [];
       if (!url || creds.length === 0) {
         if (managerOwnsBadge) { managerOwnsBadge = false; await setBadge(0); }
         return;
@@ -86,7 +108,7 @@ export function startDesktopNotifier(getSyncUrl: () => string): () => void {
       const all = new Map<string, StaffRequest>();
       let anyOk = false;
       for (const c of creds) {
-        const res = await postRequestAction(url, { action: 'getApproverRequests', approverUser: c.user, approverPass: c.pass });
+        const res = await postRequestAction(url, { action: 'getApproverRequests', approverToken: c.token });
         if (res.ok) {
           anyOk = true;
           (res.requests || []).forEach(r => all.set(r.id, r));

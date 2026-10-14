@@ -44,6 +44,8 @@ export interface User {
   registrationDate?: string; 
   checkInTime?: string; 
   checkOutTime?: string; 
+  /** pending: سجّل في وضع «بموافقة المسؤول» ولم يُقبل بعد */
+  status?: 'active' | 'pending';
 }
 
 export interface ReportAccount {
@@ -53,6 +55,8 @@ export interface ReportAccount {
   allowedJobs: string[];
   allowedEmployees?: string[]; // New: Allow specific employees access
   telegram?: boolean;           // صلاحية رسائل تليجرام لطلبات موظفيه
+  /** الخادم لا يرسل كلمة المرور — فقط هل هي مضبوطة */
+  hasPassword?: boolean;
 }
 
 export interface AttendanceRecord {
@@ -76,9 +80,10 @@ export interface AppConfig {
   syncUrl: string;
   auditLogUrl?: string; // New: URL for the audit log sheet (optional if same as syncUrl)
   adminUsername: string;
-  adminPassword?: string;
   lastUpdated?: string;
   holidays?: string[];
+  /** auto: الحساب الجديد يعمل فوراً · approval: ينتظر موافقة المسؤول */
+  registrationMode?: 'auto' | 'approval';
 }
 
 // ---------- الطلبات: الخطة الشهرية وطلب الإجازة ----------

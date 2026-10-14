@@ -18,8 +18,8 @@ import {
 
 interface Props {
   syncUrl: string;
-  approverUser: string;
-  approverPass: string;
+  /** جلسة المدير/المشرف الموقّعة */
+  approverToken: string;
   branches: Branch[];
   onPendingCount?: (n: number) => void;
   /** يُستدعى بعد كل قرار — لوحة الإدارة تحدّث به بياناتها */
@@ -33,7 +33,7 @@ const StatusChip: React.FC<{ r: StaffRequest }> = ({ r }) => (
   <span className={STATUS_META[r.status]?.chip || 'ut-chip'} style={{ height: 26, fontSize: 12 }}>{STATUS_META[r.status]?.label || r.status}</span>
 );
 
-export default function RequestsAdmin({ syncUrl, approverUser, approverPass, branches, onPendingCount, onChanged, logAction }: Props) {
+export default function RequestsAdmin({ syncUrl, approverToken, branches, onPendingCount, onChanged, logAction }: Props) {
   const [requests, setRequests] = useState<StaffRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -44,11 +44,11 @@ export default function RequestsAdmin({ syncUrl, approverUser, approverPass, bra
 
   const load = useCallback(async () => {
     setLoading(true); setError('');
-    const res = await postRequestAction(syncUrl, { action: 'getApproverRequests', approverUser, approverPass });
+    const res = await postRequestAction(syncUrl, { action: 'getApproverRequests', approverToken });
     setLoading(false);
     if (!res.ok) { setError(res.error || 'تعذّر تحميل الطلبات'); return; }
     setRequests(res.requests || []);
-  }, [syncUrl, approverUser, approverPass]);
+  }, [syncUrl, approverToken]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -83,7 +83,7 @@ export default function RequestsAdmin({ syncUrl, approverUser, approverPass, bra
       </div>
 
       {view === 'report' ? (
-        <PlanReport syncUrl={syncUrl} approverUser={approverUser} approverPass={approverPass} />
+        <PlanReport syncUrl={syncUrl} approverToken={approverToken} />
       ) : (<>
       <div className="flex flex-wrap gap-2">
         {([['pending', 'المعلّقة'], ['all', 'الكل']] as const).map(([k, l]) => (
@@ -115,7 +115,7 @@ export default function RequestsAdmin({ syncUrl, approverUser, approverPass, bra
         <div className="space-y-3">
           {visible.map(r => (
             <RequestCard key={r.id} r={r} open={openId === r.id} onToggle={() => setOpenId(openId === r.id ? null : r.id)}
-              branches={branches} syncUrl={syncUrl} approverUser={approverUser} approverPass={approverPass}
+              branches={branches} syncUrl={syncUrl} approverToken={approverToken}
               onDecided={u => { replace(u); setOpenId(null); }} onStale={load} onChanged={onChanged} logAction={logAction} />
           ))}
         </div>
@@ -129,7 +129,7 @@ export default function RequestsAdmin({ syncUrl, approverUser, approverPass, bra
 
 interface CardProps {
   r: StaffRequest; open: boolean; onToggle: () => void; branches: Branch[];
-  syncUrl: string; approverUser: string; approverPass: string;
+  syncUrl: string; approverToken: string;
   onDecided: (r: StaffRequest) => void; onStale: () => void; onChanged?: () => void;
   logAction?: (action: string, details?: string) => void;
 }
@@ -137,7 +137,7 @@ interface CardProps {
 interface Row { key: string; date: string; branchId: string; reason?: string }
 let seq = 0;
 
-const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl, approverUser, approverPass, onDecided, onStale, onChanged, logAction }) => {
+const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl, approverToken, onDecided, onStale, onChanged, logAction }) => {
   const today = todayIso();
   // الطلب المقرَّر سابقاً يُفتح على آخر ما اعتمده المدير، لا على ما أرسله الموظف
   const decided = r.status === 'approved' || r.status === 'modified';
@@ -192,7 +192,7 @@ const RequestCard: React.FC<CardProps> = ({ r, open, onToggle, branches, syncUrl
   const decide = async (decision: 'approve' | 'reject') => {
     setErr('');
     const payload: Record<string, any> = {
-      action: 'decideRequest', approverUser, approverPass, requestId: r.id, decision, note: note.trim(), submittedAt: r.submittedAt
+      action: 'decideRequest', approverToken, requestId: r.id, decision, note: note.trim(), submittedAt: r.submittedAt
     };
     if (decision === 'approve' && r.type === 'plan') {
       const dates = rows.map(x => x.date);

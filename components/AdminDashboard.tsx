@@ -5,7 +5,9 @@ import { MapPin, Table, Trash2, Shield, CloudUpload, Briefcase, RotateCcw, Globe
 import * as XLSX from 'xlsx';
 import ReportsView from './ReportsView';
 import { LazyRequestsAdmin, ScreenLoader } from './LazyScreens';
-import { postRequestAction } from './requestsApi';
+import { postRequestAction, signalSessionExpired } from './requestsApi';
+import { getApproverToken, setApproverSession, getApproverSession } from './session';
+import { getSavedLogin, setSavedLogin } from '../utils';
 import TelegramLink from './TelegramLink';
 import { Inbox } from 'lucide-react';
 
@@ -39,16 +41,15 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // لا يمرّ عبر «حفظ السحابة» الذي كان يمسح الشيت ويعيد كتابته من نسخة
   // هذا الجهاز — فيحذف من سجّل بعد فتح اللوحة ويعيد الأجهزة القديمة.
   const [savingKey, setSavingKey] = useState<string | null>(null);
-  // اسم المسؤول كما هو محفوظ في الخادم — تعديل خانة الاسم في الإعدادات قبل
-  // حفظها لا يجوز أن يُفشل كل عمليات الحفظ الأخرى
+  // اسم المسؤول كما هو محفوظ في الخادم — لمعرفة هل تغيّر في الإعدادات
   const authUserRef = useRef(config.adminUsername);
+  // الهوية = جلسة المسؤول الموقّعة (لا كلمة مرور في التطبيق)
   const adminCall = async (key: string, action: string, payload: Record<string, any>) => {
     setSavingKey(key);
-    const res = await postRequestAction(config.syncUrl, {
-      action, adminUsername: authUserRef.current, adminPassword: config.adminPassword, ...payload
-    });
+    const res = await postRequestAction(config.syncUrl, { action, adminToken: getApproverToken(), ...payload });
     setSavingKey(null);
-    if (!res.ok) alert('لم يُحفظ:\n\n' + (res.error || 'خطأ غير معروف'));
+    if (res.authExpired) { alert(res.error || 'انتهت جلسة المسؤول. ادخل مجدداً.'); signalSessionExpired(res.error); }
+    else if (!res.ok) alert('لم يُحفظ:\n\n' + (res.error || 'خطأ غير معروف'));
     return res as any;
   };
 
@@ -79,16 +80,21 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const saveReportAccounts = (upd: Upd<ReportAccount>) => {
     const prev = reportAccounts, next = resolve(upd, reportAccounts);
     setReportAccounts?.(next);
-    adminCall('list:reportAccounts', 'adminSaveReportAccounts', { accounts: next }).then(res => { if (!res.ok) setReportAccounts?.(prev); });
+    // كلمة المرور تُرسل مرة واحدة (عند الإنشاء أو التغيير) ثم تُمحى من الذاكرة —
+    // الحقل الفارغ يعني للخادم «أبقِ الحالية»
+    adminCall('list:reportAccounts', 'adminSaveReportAccounts', { accounts: next }).then(res => {
+      if (!res.ok) { setReportAccounts?.(prev); return; }
+      setReportAccounts?.(next.map(({ password, ...a }) => ({ ...a, hasPassword: a.hasPassword || !!password })));
+    });
   };
 
   // عدد الطلبات المعلّقة لشارة القائمة — جلب واحد عند فتح اللوحة
   const [pendingRequests, setPendingRequests] = useState(0);
   useEffect(() => {
-    if (!config.syncUrl || !config.adminUsername || !config.adminPassword) return;
-    postRequestAction(config.syncUrl, { action: 'getApproverRequests', approverUser: config.adminUsername, approverPass: config.adminPassword })
+    if (!config.syncUrl || !getApproverToken()) return;
+    postRequestAction(config.syncUrl, { action: 'getApproverRequests', approverToken: getApproverToken() })
       .then(res => { if (res.ok) setPendingRequests((res.requests || []).filter(r => r.status === 'pending').length); });
-  }, [config.syncUrl, config.adminUsername, config.adminPassword]);
+  }, [config.syncUrl]);
   const [newBranch, setNewBranch] = useState<Partial<Branch>>({ code: '', name: '', latitude: 0, longitude: 0, radius: 100 });
   const [newJobTitle, setNewJobTitle] = useState('');
   const [newHoliday, setNewHoliday] = useState('');
@@ -96,6 +102,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editUserData, setEditUserData] = useState<Partial<User>>({});
   const [resettingUserId, setResettingUserId] = useState<string | null>(null);
+  const [newAdminPass, setNewAdminPass] = useState('');
 
   /**
    * إعادة تعيين كلمة مرور موظف.
@@ -124,8 +131,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action: 'resetUserPassword',
-          adminUsername: config.adminUsername,
-          adminPassword: config.adminPassword,
+          adminToken: getApproverToken(),
           userId: user.id,
           nationalId: user.nationalId,
           newPassword: pass
@@ -465,7 +471,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const saveEditReportAcc = (id: string) => {
-    if (!editReportData.username || !editReportData.password) { alert("يرجى التأكد من اسم المستخدم وكلمة المرور"); return; }
+    if (!editReportData.username) { alert("يرجى التأكد من اسم المستخدم"); return; }
+    if (editReportData.password && editReportData.password.trim().length < 4) { alert("كلمة المرور الجديدة قصيرة جداً"); return; }
     // Ensure arrays are initialized if they were undefined in the edit state
     const updatedAcc = {
       ...editReportData,
@@ -549,6 +556,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 >
                   <tab.icon size={16} className={`admin-nav-item__icon ${tab.id === 'reports' ? 'text-emerald-400' : ''}`} />
                   <span className="admin-nav-item__label">{tab.label}</span>
+                  {tab.id === 'users' && allUsers.some(u => u.status === 'pending') && (
+                    <span className="mr-auto min-w-[20px] h-[20px] px-1.5 rounded-full bg-amber-500 text-slate-900 text-[11px] font-black flex items-center justify-center">{allUsers.filter(u => u.status === 'pending').length}</span>
+                  )}
                   {tab.id === 'requests' && pendingRequests > 0 && (
                     <span className="mr-auto min-w-[20px] h-[20px] px-1.5 rounded-full bg-red-500 text-white text-[11px] font-black flex items-center justify-center">{pendingRequests}</span>
                   )}
@@ -575,6 +585,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                  <Users size={18} className="text-blue-400 shrink-0" />
                  <h3 className="text-xs md:text-sm font-black text-white uppercase tracking-tighter">سجل الموظفين</h3>
                  <span className="ut-chip ut-chip--ok" style={{ height: 22, fontSize: 11 }}>يُحفظ فوراً</span>
+                 {allUsers.some(u => u.status === 'pending') && (
+                   <span className="ut-chip ut-chip--warn" style={{ height: 22, fontSize: 11 }}>{allUsers.filter(u => u.status === 'pending').length} بانتظار الموافقة</span>
+                 )}
                </div>
                <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
                   <button onClick={() => { downloadTemplate('users'); logAction('تحميل نموذج', 'نموذج استيراد الموظفين'); }} className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[10px] font-black transition-all"><Download size={13}/> نموذج استيراد</button>
@@ -595,7 +608,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </tr>
                  </thead>
                  <tbody>
-                  {allUsers.map(user => {
+                  {[...allUsers].sort((a, b) => (b.status === 'pending' ? 1 : 0) - (a.status === 'pending' ? 1 : 0)).map(user => {
                    // Calculate device count properly considering both legacy and new array
                    const deviceCount = user.deviceIds ? user.deviceIds.length : (user.deviceId ? 1 : 0);
                    const allowedCount = user.allowedDeviceCount || 1;
@@ -614,6 +627,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <div className="flex flex-col">
                             <span className="font-bold text-sm text-white">{user.fullName}</span>
                             <span className="text-blue-400 text-[10px] font-black uppercase">{user.jobTitle}</span>
+                            {user.status === 'pending' && (
+                              <span className="ut-chip ut-chip--warn mt-1 w-fit" style={{ height: 22, fontSize: 11 }}>بانتظار موافقتك</span>
+                            )}
                           </div>
                         )}
                      </td>
@@ -666,6 +682,21 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                              </>
                            ) : (
                              <>
+                               {user.status === 'pending' && (
+                                 <button
+                                   onClick={() => {
+                                     adminCall('user:' + user.id, 'adminApproveUser', { userId: user.id }).then(res => {
+                                       if (!res.ok) return;
+                                       setAllUsers(prev => prev.map(u => u.id === user.id ? { ...u, status: 'active' } : u));
+                                       logAction('قبول حساب موظف جديد', `الموظف: ${user.fullName}`);
+                                     });
+                                   }}
+                                   disabled={savingKey === 'user:' + user.id}
+                                   className="text-emerald-400 hover:bg-emerald-900/20 px-2 py-1 rounded text-[11px] font-black flex items-center gap-1 disabled:opacity-50"
+                                   title="قبول الحساب">
+                                   {savingKey === 'user:' + user.id ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} قبول
+                                 </button>
+                               )}
                                <button onClick={() => { 
                                  setEditingUserId(user.id); 
                                   setEditUserData({
@@ -1098,7 +1129,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
             <div className="bg-slate-900/50 p-3.5 md:p-4 rounded-2xl border border-slate-700 flex gap-2">
                <input type="date" className="bg-slate-900 border border-slate-700 focus:border-blue-500 rounded-xl px-3 py-2 text-xs outline-none text-white font-mono flex-1" value={newHoliday} onChange={e => setNewHoliday(e.target.value)} />
-               <button onClick={() => { if(newHoliday && !config.holidays?.includes(newHoliday)) { const newConfig = {...config, holidays: [...(config.holidays||[]), newHoliday]}; setConfig(newConfig); persistHolidays(newConfig.holidays || [], config.holidays || []); const { adminPassword, ...configToSave } = newConfig; localStorage.setItem('attendance_config', JSON.stringify(configToSave)); logAction('إضافة إجازة رسمية', `التاريخ: ${newHoliday}`); setNewHoliday(''); } }} className="bg-blue-600 hover:bg-blue-500 text-white rounded-xl px-4 py-2 text-xs font-black flex items-center gap-1.5 transition-all shrink-0"><Plus size={16}/> إضافة إجازة</button>
+               <button onClick={() => { if(newHoliday && !config.holidays?.includes(newHoliday)) { const newConfig = {...config, holidays: [...(config.holidays||[]), newHoliday]}; setConfig(newConfig); persistHolidays(newConfig.holidays || [], config.holidays || []); localStorage.setItem('attendance_config', JSON.stringify(newConfig)); logAction('إضافة إجازة رسمية', `التاريخ: ${newHoliday}`); setNewHoliday(''); } }} className="bg-blue-600 hover:bg-blue-500 text-white rounded-xl px-4 py-2 text-xs font-black flex items-center gap-1.5 transition-all shrink-0"><Plus size={16}/> إضافة إجازة</button>
             </div>
 
             <div className="flex justify-between items-center">
@@ -1108,7 +1139,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                {(config.holidays || []).sort().map(h => (
                  <div key={h} className="p-4 bg-slate-900 rounded-2xl border border-slate-700 flex justify-between items-center hover:border-blue-500 transition-all">
                    <span className="text-xs font-bold font-mono text-blue-400">{h}</span>
-                   <button onClick={() => { if(confirm('حذف الإجازة؟')) { const newConfig = {...config, holidays: config.holidays!.filter(x => x !== h)}; setConfig(newConfig); persistHolidays(newConfig.holidays || [], config.holidays || []); const { adminPassword, ...configToSave } = newConfig; localStorage.setItem('attendance_config', JSON.stringify(configToSave)); logAction('حذف إجازة رسمية', `التاريخ: ${h}`); } }} className="text-slate-600 hover:text-red-500"><Trash2 size={14}/></button>
+                   <button onClick={() => { if(confirm('حذف الإجازة؟')) { const newConfig = {...config, holidays: config.holidays!.filter(x => x !== h)}; setConfig(newConfig); persistHolidays(newConfig.holidays || [], config.holidays || []); localStorage.setItem('attendance_config', JSON.stringify(newConfig)); logAction('حذف إجازة رسمية', `التاريخ: ${h}`); } }} className="text-slate-600 hover:text-red-500"><Trash2 size={14}/></button>
                  </div>
                ))}
             </div>
@@ -1186,14 +1217,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       </td>
                       <td data-label="كلمة المرور" className="py-4 px-2 font-mono text-xs text-slate-400">
                         {editingReportId === acc.id ? (
-                          <input type="text" className="bg-slate-900 border border-blue-500 rounded px-2 py-1 text-xs w-full text-white" value={editReportData.password || ''} onChange={e => setEditReportData({...editReportData, password: e.target.value})} />
+                          <input type="text" placeholder="اتركها فارغة للإبقاء على الحالية" className="bg-slate-900 border border-blue-500 rounded px-2 py-1 text-xs w-full text-white" value={editReportData.password || ''} onChange={e => setEditReportData({...editReportData, password: e.target.value})} />
                         ) : (
-                          <div className="flex items-center gap-2">
-                            {showPass === acc.id ? acc.password : '••••••••'}
-                            <button onClick={() => setShowPass(showPass === acc.id ? null : acc.id)} className="text-slate-600 hover:text-blue-400">
-                              {showPass === acc.id ? <EyeOff size={14}/> : <Eye size={14}/>}
-                            </button>
-                          </div>
+                          // كلمات المرور محفوظة مشفّرة في الخادم ولا تصل للتطبيق — تُغيَّر ولا تُعرض
+                          <span title="محفوظة مشفّرة — لتغييرها اضغط تعديل">{acc.hasPassword === false ? 'غير مضبوطة' : '••••••••'}</span>
                         )}
                       </td>
                       <td data-label="الوظائف المسموح بها" className="py-4 px-2">
@@ -1311,10 +1338,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
         {activeTab === 'requests' && (
           <ScreenLoader>
             <div className="mb-4">
-              <TelegramLink syncUrl={config.syncUrl} approverUser={config.adminUsername} approverPass={config.adminPassword || ''} />
+              <TelegramLink syncUrl={config.syncUrl} approverToken={getApproverToken()} />
             </div>
             <LazyRequestsAdmin
-              syncUrl={config.syncUrl} approverUser={config.adminUsername} approverPass={config.adminPassword || ''}
+              syncUrl={config.syncUrl} approverToken={getApproverToken()}
               branches={branches} onPendingCount={setPendingRequests} onChanged={onRefresh} logAction={logAction}
             />
           </ScreenLoader>
@@ -1327,16 +1354,29 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
             <h4 className="text-sm font-black text-blue-400 flex items-center gap-2 uppercase tracking-widest"><Monitor size={20}/> إعدادات النظام المتقدمة</h4>
             <div className="bg-slate-900/50 p-4 md:p-6 rounded-3xl border border-slate-700 space-y-6">
-              <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-500 uppercase flex items-center gap-1">رابط ملف سجل المراقبة (Audit Log Sheet ID)</label>
-                <input 
-                  type="text" 
-                  placeholder="اتركه فارغاً لاستخدام نفس الملف الحالي، أو ضع ID لملف آخر" 
-                  className={inputClasses} 
-                  value={config.auditLogUrl || ''} 
-                  onChange={e => setConfig({...config, auditLogUrl: e.target.value})} 
-                />
-                <p className="text-[9px] text-slate-500 font-bold italic">ملاحظة: إذا كنت تريد استخدام ملف منفصل، قم بإنشاء ملف Google Sheet جديد وانسخ الـ ID الخاص به وضعه هنا.</p>
+              {/* ===== طريقة تسجيل الحسابات الجديدة ===== */}
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-slate-500 uppercase flex items-center gap-1"><UserCheck size={12}/> تسجيل الموظفين الجدد</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {([
+                    { v: 'auto', t: 'تلقائي', d: 'الحساب الجديد يعمل فوراً' },
+                    { v: 'approval', t: 'بموافقة المسؤول', d: 'لا يدخل الموظف حتى تقبله من «الموظفين»' }
+                  ] as const).map(o => (
+                    <button key={o.v} type="button" disabled={savingKey === 'settings:reg'}
+                      onClick={async () => {
+                        if ((config.registrationMode || 'auto') === o.v) return;
+                        const res = await adminCall('settings:reg', 'adminSaveSettings', { registrationMode: o.v });
+                        if (!res.ok) return;
+                        setConfig(c => { const n = { ...c, registrationMode: o.v }; localStorage.setItem('attendance_config', JSON.stringify(n)); return n; });
+                        logAction('تغيير طريقة تسجيل الموظفين', o.t);
+                      }}
+                      className={`text-right p-3 rounded-xl border transition-all ${(config.registrationMode || 'auto') === o.v ? 'bg-blue-600/20 border-blue-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500'}`}>
+                      <div className="text-xs font-black">{o.t}</div>
+                      <div className="text-[10px] font-bold opacity-80 mt-0.5">{o.d}</div>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-slate-500 font-bold">في الحالتين تصلك رسالة تليجرام عند كل تسجيل جديد (إن كان حساب المسؤول مربوطاً بتليجرام).</p>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t border-slate-700">
@@ -1350,30 +1390,50 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-500 uppercase flex items-center gap-1">كلمة مرور المسؤول (Admin Password)</label>
-                  <div className="bg-slate-950/60 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-400 font-bold leading-relaxed">
-                    تواصل مع المسؤل لمعرفة كلمة المرور .
-                  </div>
+                  <label className="text-[10px] font-black text-slate-500 uppercase flex items-center gap-1"><Lock size={12}/> كلمة مرور جديدة للمسؤول (اختياري)</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder="اتركها فارغة للإبقاء على الحالية"
+                    className={inputClasses}
+                    value={newAdminPass}
+                    onChange={e => setNewAdminPass(e.target.value)}
+                  />
+                  <p className="text-[9px] text-slate-500 font-bold">تُحفظ مشفّرة في الخادم. تغييرها يُخرج جلسات المسؤول المفتوحة على الأجهزة الأخرى.</p>
                 </div>
               </div>
               
               <div className="pt-4 border-t border-slate-700">
                 <button 
+                  disabled={savingKey === 'settings'}
                   onClick={async () => {
-                    const { adminPassword, ...configToSave } = config;
-                    if ((config.adminUsername || '') !== (authUserRef.current || '')) {
-                      // اسم المسؤول يتغير في الخادم أولاً؛ التوثيق بالاسم القديم المحفوظ
-                      const res = await adminCall('settings', 'adminSaveSettings', { newAdminUsername: config.adminUsername });
+                    const payload: Record<string, any> = {};
+                    const nameChanged = (config.adminUsername || '') !== (authUserRef.current || '');
+                    if (nameChanged) payload.newAdminUsername = config.adminUsername;
+                    const newPass = newAdminPass.trim();
+                    if (newPass) {
+                      if (newPass.length < 6 || newPass.startsWith('0')) { alert('كلمة المرور ٦ خانات فأكثر ولا تبدأ بصفر.'); return; }
+                      if (prompt('أعد كتابة كلمة المرور الجديدة للتأكيد:')?.trim() !== newPass) { alert('كلمتا المرور غير متطابقتين.'); return; }
+                      payload.newAdminPassword = newPass;
+                    }
+                    if (Object.keys(payload).length) {
+                      const res = await adminCall('settings', 'adminSaveSettings', payload);
                       if (!res.ok) return;
                       authUserRef.current = config.adminUsername;
+                      const cur = getApproverSession();
+                      const token = res.token || cur?.token || '';
+                      if (token) setApproverSession({ token, user: config.adminUsername, isAdmin: true });
+                      // «تذكرني» المحفوظ يُحدَّث بالجلسة الجديدة (القديمة سقطت بتغيير كلمة المرور)
+                      if (getSavedLogin('admin') && token) setSavedLogin('admin', config.adminUsername, token);
+                      setNewAdminPass('');
                     }
-                    localStorage.setItem('attendance_config', JSON.stringify(configToSave));
+                    localStorage.setItem('attendance_config', JSON.stringify(config));
                     alert('تم حفظ الإعدادات بنجاح');
-                    logAction('تحديث إعدادات النظام', 'تغيير إعدادات النظام');
+                    logAction('تحديث إعدادات النظام', [nameChanged ? 'تغيير اسم المسؤول' : '', newPass ? 'تغيير كلمة مرور المسؤول' : ''].filter(Boolean).join('، ') || 'حفظ');
                   }} 
-                  className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg transition-all"
+                  className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg transition-all disabled:opacity-60"
                 >
-                  <Check size={20} /> حفظ الإعدادات
+                  {savingKey === 'settings' ? <Loader2 size={20} className="animate-spin" /> : <Check size={20} />} حفظ الإعدادات
                 </button>
               </div>
             </div>

@@ -6,15 +6,16 @@ import Login from './components/Login';
 import { LazyAdminDashboard, LazyReportsView, ScreenLoader } from './components/LazyScreens';
 import UserDashboard from './components/UserDashboard';
 import { ShieldCheck, User as UserIcon, Cloud, CloudOff, RefreshCw, FileSpreadsheet, Home, Download, Share, PlusSquare, X, Wifi, LogOut, ShieldAlert, AlertTriangle, Smartphone, Settings } from 'lucide-react';
-import { syncTimeWithServer, checkDeveloperOptionsStatus, getDeviceFingerprint } from './utils';
+import { syncTimeWithServer, checkDeveloperOptionsStatus, getDeviceFingerprint, getSavedLogin, setSavedLogin, clearSavedLogin } from './utils';
+import { getEmployeeToken, setEmployeeToken, clearEmployeeToken, getApproverSession, getApproverToken, setApproverSession, renewApproverToken, postJson, loginApprover } from './components/session';
 import { LogoMark } from './components/Logo';
 import { startDesktopNotifier, setSessionApprover } from './components/desktopNotify';
 
-// ==========================================
-// المصدر الرئيسي الوحيد لكلمة مرور المسؤول (Admin Password)
-// يمكنك تغييرها هنا مباشرة وسيتم تحديثها تلقائياً في كل التطبيق
-const ADMIN_PASSWORD_SSOT = 'Ba522129';
-// ==========================================
+// كلمة مرور المسؤول لم تعد في الكود: تُضبط في شيت Config (admin_pass) وتُغيَّر
+// من لوحة الإدارة ← الإعدادات، والتحقق منها في الخادم وحده.
+
+/** بقايا النسخ القديمة: قائمة الموظفين بكلمات مرورهم كانت تُخزَّن على كل جهاز */
+try { localStorage.removeItem('attendance_users'); localStorage.removeItem('attendance_report_accounts'); } catch (e) { /* التخزين محجوب */ }
 
 /**
  * وصف مختصر للجهاز لعمود Device Info في شيت الأودت.
@@ -54,6 +55,8 @@ const App: React.FC = () => {
   });
   // مرجع للمستخدم الحالي داخل syncWithCloud (بلا اعتماديات عمداً)
   const currentUserRef = useRef<User | null>(null);
+  // مستخدم محفوظ من نسخة ما قبل التحديث الأمني — يُحوَّل دخوله إلى جلسة مرة واحدة
+  const legacyUserRef = useRef<User | null>(null);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState(false);
@@ -103,14 +106,12 @@ const App: React.FC = () => {
       googleSheetLink: '',
       syncUrl: '',
       auditLogUrl: '',
-      adminUsername: 'admin',
-      adminPassword: ADMIN_PASSWORD_SSOT
+      adminUsername: 'admin'
     };
     if (saved) {
       try {
-        const parsed = JSON.parse(saved);
-        // Always force adminPassword to be the ADMIN_PASSWORD_SSOT from the code, ignoring any saved password
-        return { ...defaultConfig, ...parsed, adminPassword: ADMIN_PASSWORD_SSOT };
+        const { adminPassword: _legacy, ...parsed } = JSON.parse(saved);
+        return { ...defaultConfig, ...parsed };
       } catch (e) {
         return defaultConfig;
       }
@@ -196,16 +197,29 @@ const App: React.FC = () => {
       // مزامنة الوقت بالخلفية لضمان دقة ساعة التطبيق بالتوقيت المصري وحمايته من التلاعب
       syncTimeWithServer().catch(e => console.warn('Background time sync failed', e));
 
-      // الموظف المسجَّل وحده يطلب نطاقه. شاشة الدخول (لا مستخدم) والمسؤول
-      // يطلبان كل شيء كما كان. الخادم القديم يتجاهل المعامل فيردّ بكل شيء.
+      // ما يُرسله الخادم يحدّده صاحب الجلسة: بلا جلسة → الإعدادات العامة فقط،
+      // جلسة موظف → بياناته وخططه، جلسة مسؤول → كل الموظفين (بلا كلمات مرور).
       const u = currentUserRef.current;
-      const employeeScope = !!(u && u.role !== 'admin' && u.id);
-      const scopeParam = employeeScope ? `&scope=employee&userId=${encodeURIComponent(String(u!.id))}` : '';
-      const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}action=getData${scopeParam}&t=${Date.now()}`;
-      const response = await fetch(fetchUrl, controller ? { signal: controller.signal } : undefined);
+      const payload: Record<string, any> = { action: 'getData' };
+      if (u && u.role === 'admin') payload.approverToken = getApproverToken();
+      else if (u) payload.token = getEmployeeToken();
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        signal: controller ? controller.signal : undefined
+      });
       if (!response.ok) throw new Error('فشل الاتصال');
       const data = await response.json();
-      
+
+      // الجلسة انتهت أو أُلغيت (صفّر المسؤول الأجهزة، حذف الحساب، غيّر كلمة المرور)
+      if (data.authExpired && u && currentUserRef.current === u) {
+        expireSessionRef.current(data.authError || '');
+        return data;
+      }
+      if (data.token) setEmployeeToken(data.token);
+      if (data.approverToken) renewApproverToken(data.approverToken);
+
       if (data.branches) {
         setBranches(data.branches);
         localStorage.setItem('attendance_branches', JSON.stringify(data.branches));
@@ -216,11 +230,10 @@ const App: React.FC = () => {
       }
       if (data.reportAccounts) {
         setReportAccounts(data.reportAccounts);
-        localStorage.setItem('attendance_report_accounts', JSON.stringify(data.reportAccounts));
       }
       if (data.users && Array.isArray(data.users)) {
-        setAllUsers(data.users);
-        localStorage.setItem('attendance_users', JSON.stringify(data.users));
+        // في الذاكرة فقط — لا تُحفظ قائمة الموظفين على الجهاز
+        if (data.scope === 'full') setAllUsers(data.users);
         
         // Update current user if already logged in (using functional update to avoid stale closure)
         setCurrentUser(prev => {
@@ -239,16 +252,16 @@ const App: React.FC = () => {
         localStorage.setItem('attendance_visit_plans', JSON.stringify(data.visitPlans));
       }
 
-      // الخادم يعلن النطاق الذي ردّ به؛ الخادم القديم لا يعلنه فالبيانات كاملة
-      const receivedScope: 'full' | 'employee' = data.scope === 'employee' ? 'employee' : 'full';
+      // الخادم يعلن النطاق الذي ردّ به — «full» لجلسة المسؤول وحدها
+      const receivedScope: 'full' | 'employee' = data.scope === 'full' ? 'full' : 'employee';
       setDataScope(receivedScope);
       try { localStorage.setItem('attendance_data_scope', receivedScope); } catch (e) { /* التخزين محجوب */ }
       
       setConfig(prev => {
         const updatedConfig = { ...prev, lastUpdated: new Date().toISOString(), syncUrl: url, googleSheetLink: url };
         if (data.holidays) updatedConfig.holidays = data.holidays;
-        const { adminPassword, ...configToSave } = updatedConfig;
-        localStorage.setItem('attendance_config', JSON.stringify(configToSave));
+        if (data.registrationMode) updatedConfig.registrationMode = data.registrationMode;
+        localStorage.setItem('attendance_config', JSON.stringify(updatedConfig));
         return updatedConfig;
       });
 
@@ -276,19 +289,28 @@ const App: React.FC = () => {
     const savedBranches = localStorage.getItem('attendance_branches');
     const savedJobs = localStorage.getItem('attendance_jobs');
     const savedPlans = localStorage.getItem('attendance_visit_plans');
-    const savedUsers = localStorage.getItem('attendance_users');
-    const savedReportAccounts = localStorage.getItem('attendance_report_accounts');
-    
+    let legacyUser: User | null = null;
     if (savedUser) {
-      const parsedUser = JSON.parse(savedUser);
-      currentUserRef.current = parsedUser;
-      setCurrentUser(parsedUser);
+      try {
+        const parsedUser = JSON.parse(savedUser);
+        // النسخ القديمة كانت تحفظ كلمة مرور الموظف مع بياناته — تُقرأ مرة واحدة
+        // لتحويل الدخول إلى جلسة، ثم تُحذف من الجهاز
+        if (parsedUser && parsedUser.password) {
+          legacyUser = parsedUser;
+          const { password: _pw, ...clean } = parsedUser;
+          localStorage.setItem('attendance_current_user', JSON.stringify(clean));
+          currentUserRef.current = clean;
+          setCurrentUser(clean);
+        } else {
+          legacyUser = parsedUser;
+          currentUserRef.current = parsedUser;
+          setCurrentUser(parsedUser);
+        }
+      } catch (e) { localStorage.removeItem('attendance_current_user'); }
     }
     if (savedBranches) setBranches(JSON.parse(savedBranches));
     if (savedJobs) setJobs(JSON.parse(savedJobs));
     if (savedPlans) setVisitPlans(JSON.parse(savedPlans));
-    if (savedUsers) setAllUsers(JSON.parse(savedUsers));
-    if (savedReportAccounts) setReportAccounts(JSON.parse(savedReportAccounts));
     
     // Check URL params for cloud link
     const params = new URLSearchParams(window.location.search);
@@ -305,14 +327,17 @@ const App: React.FC = () => {
       } catch (e) {}
     }
 
+    legacyUserRef.current = legacyUser;
     if (urlToSync) {
-      syncWithCloud(urlToSync);
+      // الأجهزة المسجّلة الدخول قبل التحديث الأمني تحصل على جلسة أولاً ثم تُزامن
+      ensureSession(urlToSync, legacyUser).finally(() => syncWithCloud(urlToSync));
     }
   }, []);
 
   // المسؤول على جهاز بياناته جزئية (كان عليه موظف): مزامنة كاملة فوراً
   useEffect(() => {
-    if (currentUser?.role === 'admin' && dataScope === 'employee' && config.syncUrl && isOnline) {
+    // بلا جلسة مسؤول بعد (ما زالت تُنشأ عند الفتح) لا فائدة من المزامنة — ensureSession يُزامن بعدها
+    if (currentUser?.role === 'admin' && dataScope === 'employee' && config.syncUrl && isOnline && getApproverToken()) {
       syncWithCloud(config.syncUrl, true);
     }
   }, [currentUser, dataScope, config.syncUrl, isOnline, syncWithCloud]);
@@ -458,11 +483,12 @@ const App: React.FC = () => {
                   googleSheetLink: data.googleSheetLink,
                   auditLogUrl: data.auditLogUrl !== undefined ? data.auditLogUrl : prev.auditLogUrl
                 };
-                const { adminPassword, ...configToSave } = updatedConfig;
-                localStorage.setItem('attendance_config', JSON.stringify(configToSave));
+                localStorage.setItem('attendance_config', JSON.stringify(updatedConfig));
                 return updatedConfig;
               });
-              syncWithCloud(data.googleSheetLink);
+              // أول ربط بالرابط (أو تغيّره): الجلسة أولاً ثم المزامنة
+              const link = data.googleSheetLink;
+              ensureSession(link, legacyUserRef.current || currentUserRef.current).finally(() => syncWithCloud(link));
             }
           }
         }
@@ -484,13 +510,15 @@ const App: React.FC = () => {
     if (!config.syncUrl || !navigator.onLine) return;
     
     try {
+      // الجلسة ترافق السطر ليُعلَّم «موثّقاً» في شيت الأودت
       const payload = {
         action: 'logAudit',
         user: currentUser ? `${currentUser.fullName} (${currentUser.role})` : 'Guest',
         auditAction: action,
         details: details,
         deviceInfo: describeDevice(),
-        spreadsheetId: config.auditLogUrl || ''
+        token: currentUser && currentUser.role !== 'admin' ? getEmployeeToken() : undefined,
+        approverToken: currentUser && currentUser.role === 'admin' ? getApproverToken() : undefined
       };
       
       await fetch(config.syncUrl, {
@@ -502,7 +530,7 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Audit Log Error:', e);
     }
-  }, [config.syncUrl, config.auditLogUrl, currentUser]);
+  }, [config.syncUrl, currentUser]);
 
   // إشعارات طلبات الموظفين في تطبيق ويندوز (لا تعمل في المتصفح أو الهاتف)
   const syncUrlRef = useRef('');
@@ -515,14 +543,19 @@ const App: React.FC = () => {
 
   // جلسة المسؤول المفتوحة تصلح لفحص الطلبات كذلك
   useEffect(() => {
-    if (currentUser && currentUser.role === 'admin' && config.adminUsername && config.adminPassword) {
-      setSessionApprover({ user: config.adminUsername, pass: config.adminPassword });
+    const s = getApproverSession();
+    if (currentUser && currentUser.role === 'admin' && s) {
+      setSessionApprover({ user: s.user, token: s.token });
     }
-  }, [currentUser, config.adminUsername, config.adminPassword]);
+  }, [currentUser]);
 
   const handleLogin = (user: User) => {
-    setCurrentUser(user);
-    localStorage.setItem('attendance_current_user', JSON.stringify(user));
+    // دخول المسؤول يستدعي مزامنة كاملة بجلسته (انظر التأثير أعلاه) — قائمة الموظفين لا تُحفظ على الجهاز
+    if (user.role === 'admin') setDataScope('employee');
+    const { password: _pw, ...clean } = user as any;
+    currentUserRef.current = clean;
+    setCurrentUser(clean);
+    localStorage.setItem('attendance_current_user', JSON.stringify(clean));
   };
 
   const handleLogout = () => {
@@ -530,16 +563,87 @@ const App: React.FC = () => {
       logAction('تسجيل خروج', `المستخدم: ${currentUser.fullName} (${currentUser.role})`);
     }
     localStorage.removeItem('attendance_current_user');
+    clearEmployeeToken();
+    setApproverSession(null);
     setSessionApprover(null);
+    setAllUsers([]);
+    setReportAccounts([]);
+    setVisitPlans([]);
+    currentUserRef.current = null;
     setCurrentUser(null);
     setActiveView('main');
   };
 
   const handleUpdateConfig = (newCfg: Partial<AppConfig>) => {
-    const cfg = { ...config, ...newCfg, adminPassword: ADMIN_PASSWORD_SSOT };
+    const cfg = { ...config, ...newCfg };
     setConfig(cfg);
-    const { adminPassword, ...configToSave } = cfg;
-    localStorage.setItem('attendance_config', JSON.stringify(configToSave));
+    localStorage.setItem('attendance_config', JSON.stringify(cfg));
+  };
+
+  // انتهاء الجلسة من الخادم: خروج إلى شاشة الدخول مع رسالة واضحة
+  const [sessionNotice, setSessionNotice] = useState('');
+  const expireSessionRef = useRef<(msg: string) => void>(() => {});
+  expireSessionRef.current = (msg: string) => {
+    localStorage.removeItem('attendance_current_user');
+    clearEmployeeToken();
+    setApproverSession(null);
+    setSessionApprover(null);
+    setAllUsers([]);
+    setReportAccounts([]);
+    setVisitPlans([]);
+    currentUserRef.current = null;
+    setCurrentUser(null);
+    setActiveView('main');
+    setSessionNotice(msg || 'انتهت جلسة الدخول. ادخل مجدداً.');
+  };
+
+  useEffect(() => {
+    const onExpired = (e: Event) => {
+      if (currentUserRef.current) expireSessionRef.current(String((e as CustomEvent).detail || ''));
+    };
+    window.addEventListener('uniteam:session-expired', onExpired);
+    return () => window.removeEventListener('uniteam:session-expired', onExpired);
+  }, []);
+
+  /**
+   * تحويل دخول قديم (قبل التحديث الأمني) إلى جلسة موقّعة — مرة واحدة وبصمت:
+   *   موظف: بكلمة المرور المحفوظة قديماً إن وُجدت، وإلا بالرقم القومي والجهاز
+   *         (يقبله الخادم خلال فترة الانتقال فقط).
+   *   مسؤول: بجلسة/كلمة «تذكرني» المحفوظة، وإلا يُطلب منه الدخول مجدداً.
+   * فشل الشبكة لا يُخرج أحداً — تُعاد المحاولة عند الفتح التالي.
+   */
+  const ensureSession = async (url: string, user: User | null): Promise<void> => {
+    if (!user || !navigator.onLine) return;
+    try {
+      if (user.role === 'admin') {
+        if (getApproverSession()) return;
+        const saved = getSavedLogin('admin');
+        if (saved) {
+          const r = await loginApprover(url, saved.token ? { token: saved.token } : { user: saved.user, pass: saved.pass });
+          if (r.ok && r.token && r.isAdmin) {
+            setApproverSession({ token: r.token, user: saved.user, isAdmin: true });
+            setSavedLogin('admin', saved.user, r.token);
+            return;
+          }
+          if (r.network) return; // الشبكة — تُعاد المحاولة عند الفتح التالي
+          clearSavedLogin('admin');
+        }
+        expireSessionRef.current('حدّثنا نظام الدخول. ادخل بكلمة مرور المسؤول مرة واحدة.');
+        return;
+      }
+      if (getEmployeeToken()) return;
+      const res = user.password
+        ? await postJson(url, { action: 'loginEmployee', nationalId: user.nationalId, password: String(user.password), deviceId: getDeviceFingerprint() })
+        : await postJson(url, { action: 'sessionExchange', nationalId: user.nationalId, deviceId: getDeviceFingerprint() });
+      if (res && res.ok && res.token) {
+        setEmployeeToken(res.token);
+        if (res.user) handleLogin({ ...res.user, role: 'employee' });
+      } else if (res && res.ok === false && !/مشغول/.test(res.error || '')) {
+        expireSessionRef.current(res.error || '');
+      }
+    } catch (e) {
+      console.warn('session upgrade deferred', e);
+    }
   };
 
   // Determine if we should show an install button (Android or iOS web)
@@ -760,8 +864,9 @@ const App: React.FC = () => {
         ) : (
           !currentUser ? (
             <Login
-              onLogin={handleLogin} allUsers={allUsers} adminConfig={config} availableJobs={jobs}
+              onLogin={(u) => { setSessionNotice(''); handleLogin(u); }} adminConfig={config} availableJobs={jobs}
               branches={branches}
+              notice={sessionNotice}
               setAdminConfig={handleUpdateConfig}
               logAction={logAction}
               onSync={syncWithCloud}

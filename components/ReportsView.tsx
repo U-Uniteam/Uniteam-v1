@@ -7,6 +7,7 @@ import { LazyRequestsAdmin, ScreenLoader } from './LazyScreens';
 import { postRequestAction } from './requestsApi';
 import { getSavedLogin, setSavedLogin, clearSavedLogin } from '../utils';
 import { setSessionApprover } from './desktopNotify';
+import { postJson, describeNetError, getApproverToken, renewApproverToken } from './session';
 import TelegramLink from './TelegramLink';
 import { computeCommitment, DayDetail } from './commitment';
 import { Inbox, ChevronDown as ReqChevron } from 'lucide-react';
@@ -141,12 +142,18 @@ const CustomDatePicker = ({ label, value, onChange, placeholder }: { label: stri
   );
 };
 
+/** مصدر التسجيل كما يكتبه الخادم (عمود Source) — فارغ في السجلات الأقدم من إضافته */
+const SOURCE_LABELS: Record<string, string> = { android: 'Android', windows: 'Windows', browser: 'Browser' };
+const sourceLabel = (v?: string) => (v ? SOURCE_LABELS[v] || v : '');
+
 export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUpdateConfig, logAction, onLoginStateChange, onLogoutRef, autoLoginAdmin }: ReportsViewProps) {
   const [localSyncUrl, setLocalSyncUrl] = useState(initialSyncUrl || localStorage.getItem('attendance_temp_sync_url') || '');
-  // «تذكرني»: بيانات حساب التقارير المحفوظة على هذا الجهاز (لا تُستعمل في وضع المسؤول)
+  // «تذكرني»: جلسة حساب التقارير المحفوظة على هذا الجهاز (لا تُستعمل في وضع المسؤول)
   const [savedReports] = useState(() => (autoLoginAdmin ? null : getSavedLogin('reports')));
   const [username, setUsername] = useState(savedReports?.user || '');
-  const [password, setPassword] = useState(savedReports?.pass || '');
+  const [password, setPassword] = useState('');
+  // جلسة الحساب المفتوح الآن في هذه الشاشة — تُرسل بدل كلمة المرور في كل طلب
+  const [approverToken, setApproverToken] = useState('');
   const [rememberMe, setRememberMe] = useState(!!savedReports);
   const [showPassword, setShowPassword] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -159,6 +166,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
     if (onLogoutRef) {
       onLogoutRef.current = () => {
         setIsLoggedIn(false);
+        setApproverToken('');
         setSessionApprover(null);
         logAction?.('تسجيل خروج متابع تقارير', `المستخدم: ${username}`);
       };
@@ -221,79 +229,80 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
   const [dashFilter, setDashFilter] = useState<'all' | 'high' | 'med' | 'low'>('all');
   const activeSyncUrl = localSyncUrl || initialSyncUrl;
 
-  const fetchData = async (showLoading = true, customUser?: string, customPass?: string) => {
-    const u = customUser !== undefined ? customUser : username;
-    const p = customPass !== undefined ? customPass : password;
+  /**
+   * جلب بيانات التقارير. الهوية بإحدى ثلاث: كلمة المرور (دخول جديد)، أو جلسة
+   * محفوظة، أو جلسة المسؤول المفتوحة (داخل لوحة الإدارة). الخادم يُرجع جلسة
+   * جديدة عند الدخول بكلمة المرور أو عند اقتراب انتهاء الجلسة.
+   */
+  type Creds = { user?: string; pass?: string; token?: string };
+  const fetchData = async (showLoading = true, creds?: Creds) => {
+    const c: Creds = creds || (approverToken ? { user: username, token: approverToken } : { user: username, pass: password });
+    const u = (c.user || '').trim();
     if (!activeSyncUrl) { setError('يرجى إدخال رابط المزامنة الخاص بالشركة أولاً'); setShowUrlField(true); return; }
-    if (!u || !p) { setError('يرجى إدخل اسم المستخدم وكلمة المرور'); return; }
+    if (!c.token && (!u || !c.pass)) { setError('يرجى إدخل اسم المستخدم وكلمة المرور'); return; }
     if (showLoading) setIsLoading(true); else setIsRefreshing(true);
     setError('');
     try {
-      const response = await fetch(`${activeSyncUrl}?action=getReportData&user=${encodeURIComponent(u)}&pass=${encodeURIComponent(p)}`);
-      const data = await response.json();
+      const data: any = await postJson(activeSyncUrl, c.token
+        ? { action: 'getReportData', approverToken: c.token }
+        : { action: 'getReportData', approverUser: u, approverPass: c.pass }, 60000);
       if (data.error) { 
-        // كلمة مرور محفوظة لم تعد صحيحة (غيّرها المسؤول مثلاً) — تُمسح حتى لا تتكرر المحاولة
-        if (showLoading && !autoLoginAdmin && rememberMe) { clearSavedLogin('reports'); setRememberMe(false); }
-        setError('بيانات الدخول غير صحيحة'); 
-        if (showLoading) setIsLoggedIn(false); 
+        // جلسة محفوظة لم تعد صالحة (غُيّرت كلمة المرور مثلاً) — تُمسح حتى لا تتكرر المحاولة
+        if (!autoLoginAdmin && (c.token || rememberMe)) { clearSavedLogin('reports'); }
+        setApproverToken('');
+        setError(c.token ? 'انتهت الجلسة. ادخل بكلمة المرور.' : (data.error === 'Invalid login' ? 'بيانات الدخول غير صحيحة' : data.error)); 
+        if (showLoading || c.token) setIsLoggedIn(false); 
       } else { 
-        if (showLoading && !autoLoginAdmin) {
-          if (rememberMe) setSavedLogin('reports', u, p); else clearSavedLogin('reports');
+        const token: string = data.token || c.token || '';
+        setApproverToken(token);
+        setPassword('');
+        if (autoLoginAdmin) renewApproverToken(data.token);
+        else if (showLoading) {
+          if (rememberMe && token) setSavedLogin('reports', u, token); else if (!rememberMe) clearSavedLogin('reports');
         }
-        setSessionApprover({ user: u, pass: p });
-        // Handle new response format { records: [], users: [] }
-        if (Array.isArray(data)) {
-           // Backward compatibility
-           setRecords(data); 
-           setAuthorizedUsers([]);
-           setVisitPlans([]);
-        } else {
-           setRecords(data.records || []);
-           const users = (data.users && data.users.length > 0) ? data.users : JSON.parse(localStorage.getItem('attendance_users') || '[]');
-           setAuthorizedUsers(users);
-           const plans = (data.visitPlans && data.visitPlans.length > 0) ? data.visitPlans : JSON.parse(localStorage.getItem('attendance_visit_plans') || '[]');
-           setVisitPlans(plans);
-           const jobs = (data.jobs && data.jobs.length > 0) ? data.jobs : JSON.parse(localStorage.getItem('attendance_jobs') || '[]');
-           setFetchedJobs(jobs);
-           const branches = (data.branches && data.branches.length > 0) ? data.branches : JSON.parse(localStorage.getItem('attendance_branches') || '[]');
-           setFetchedBranches(branches);
-           const config = JSON.parse(localStorage.getItem('attendance_config') || '{}');
-           const holidays = (data.holidays && data.holidays.length > 0) ? data.holidays : (config.holidays || []);
-           setFetchedHolidays(holidays);
-        }
+        if (u) setUsername(u);
+        setSessionApprover({ user: u || username, token });
+        setRecords(data.records || []);
+        setAuthorizedUsers(data.users || []);
+        setVisitPlans(data.visitPlans || []);
+        const jobs = (data.jobs && data.jobs.length > 0) ? data.jobs : JSON.parse(localStorage.getItem('attendance_jobs') || '[]');
+        setFetchedJobs(jobs);
+        const branches = (data.branches && data.branches.length > 0) ? data.branches : JSON.parse(localStorage.getItem('attendance_branches') || '[]');
+        setFetchedBranches(branches);
+        const config = JSON.parse(localStorage.getItem('attendance_config') || '{}');
+        const holidays = (data.holidays && data.holidays.length > 0) ? data.holidays : (config.holidays || []);
+        setFetchedHolidays(holidays);
         setIsLoggedIn(true); 
-        if (!autoLoginAdmin) {
-          postRequestAction(activeSyncUrl, { action: 'getApproverRequests', approverUser: u, approverPass: p })
+        if (!autoLoginAdmin && token) {
+          postRequestAction(activeSyncUrl, { action: 'getApproverRequests', approverToken: token })
             .then(res => { if (res.ok) setPendingRequests((res.requests || []).filter(r => r.status === 'pending').length); });
         }
-        logAction?.('تسجيل دخول متابع تقارير', `المستخدم: ${u}`);
-        if (adminConfig && u === adminConfig.adminUsername && p === adminConfig.adminPassword) setIsAdminLogin(true); 
-        else setIsAdminLogin(false); 
+        if (showLoading) logAction?.('تسجيل دخول متابع تقارير', `المستخدم: ${u || username}`);
+        setIsAdminLogin(!!data.isAdmin);
         localStorage.setItem('attendance_temp_sync_url', activeSyncUrl); 
         setShowUrlField(false); 
       }
     } catch (err) { 
-      setError('خطأ في الاتصال'); 
-      setShowUrlField(true);
+      setError(describeNetError(err)); 
+      if (!c.token) setShowUrlField(true);
       logAction?.('فشل جلب بيانات التقارير', `المستخدم: ${u}, الخطأ: ${err instanceof Error ? err.message : String(err)}`);
     } finally { setIsLoading(false); setIsRefreshing(false); }
   };
 
+  // داخل لوحة الإدارة: بجلسة المسؤول المفتوحة
   useEffect(() => {
     if (autoLoginAdmin) {
       const adminUser = adminConfig?.adminUsername || 'admin';
-      const adminPass = adminConfig?.adminPassword || '';
       setUsername(adminUser);
-      setPassword(adminPass);
       setIsAdminLogin(true);
-      fetchData(true, adminUser, adminPass);
+      fetchData(true, { user: adminUser, token: getApproverToken() });
     }
   }, [autoLoginAdmin, adminConfig?.syncUrl]);
 
-  // دخول تلقائي ببيانات «تذكرني» المحفوظة
+  // دخول تلقائي بجلسة «تذكرني» المحفوظة (أو بكلمة مرور محفوظة من نسخة قديمة — تُستبدل بجلسة)
   useEffect(() => {
     if (!autoLoginAdmin && savedReports && activeSyncUrl) {
-      fetchData(true, savedReports.user, savedReports.pass);
+      fetchData(true, savedReports.token ? { user: savedReports.user, token: savedReports.token } : { user: savedReports.user, pass: savedReports.pass });
     }
     // مرة واحدة عند فتح الشاشة
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -336,7 +345,8 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
         'Type': r.type === 'check-in' ? 'Check-In' : 'Check-Out',
         'Time Diff': r.timeDiff || '', 
         'Reason/Notes': r.reason || '',
-        'GPS Location': r.gps
+        'GPS Location': r.gps,
+        'Source': sourceLabel(r.source)
       };
     });
 
@@ -1010,10 +1020,12 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             'كود فرع الحضور': rawIn ? getBranchCode(rawIn.branch, rawIn) : '',
             'فرع الحضور': rawIn ? rawIn.branch : '',
             'حالة الحضور': inStatus,
+            'مصدر الحضور': rawIn ? sourceLabel(rawIn.source) : '',
             'وقت الانصراف': rawOut ? new Date(rawOut.time).toLocaleTimeString('en-US') : 'لم يسجل',
             'كود فرع الانصراف': rawOut ? getBranchCode(rawOut.branch, rawOut) : '',
             'فرع الانصراف': rawOut ? rawOut.branch : '',
-            'حالة الانصراف': outStatus
+            'حالة الانصراف': outStatus,
+            'مصدر الانصراف': rawOut ? sourceLabel(rawOut.source) : ''
           });
         }
         dayWalker.setDate(dayWalker.getDate() + 1);
@@ -1158,9 +1170,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
               <button 
                 type="button" 
                 onClick={() => {
-                  const adminUser = adminConfig?.adminUsername || 'admin';
-                  const adminPass = adminConfig?.adminPassword || '';
-                  fetchData(true, adminUser, adminPass);
+                  fetchData(true, { user: adminConfig?.adminUsername || 'admin', token: getApproverToken() });
                 }}
                 className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-xl text-xs font-black shadow-lg cursor-pointer transition-all active:scale-95 flex items-center gap-2"
               >
@@ -1183,7 +1193,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
             <h2 className="text-2xl font-black text-white uppercase tracking-tighter">Reports Access</h2>
             <p className="text-slate-500 text-[10px] font-black uppercase mt-1">نظام متابعة التقارير والوظائف</p>
           </div>
-          <form onSubmit={(e) => {e.preventDefault(); fetchData();}} className="space-y-4">
+          <form onSubmit={(e) => {e.preventDefault(); fetchData(true, { user: username, pass: password });}} className="space-y-4">
             <div className="space-y-2">
               <label className="text-[10px] font-black text-white mr-2 uppercase tracking-widest">اسم المستخدم</label>
               <input type="text" className="w-full bg-slate-900 border border-slate-700 text-white px-5 py-3.5 rounded-2xl font-bold outline-none focus:border-blue-500 transition-all shadow-inner" value={username} onChange={e => setUsername(e.target.value)} />
@@ -1255,7 +1265,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
       </div>
       
       {!autoLoginAdmin && (
-        <TelegramLink syncUrl={activeSyncUrl} approverUser={username} approverPass={password} />
+        <TelegramLink syncUrl={activeSyncUrl} approverToken={approverToken} />
       )}
 
       {!autoLoginAdmin && (
@@ -1271,7 +1281,7 @@ export default function ReportsView({ syncUrl: initialSyncUrl, adminConfig, onUp
           {showRequests && (
             <div className="px-4 md:px-6 pb-5">
               <ScreenLoader>
-                <LazyRequestsAdmin syncUrl={activeSyncUrl} approverUser={username} approverPass={password}
+                <LazyRequestsAdmin syncUrl={activeSyncUrl} approverToken={approverToken}
                   branches={fetchedBranches} onPendingCount={setPendingRequests} logAction={logAction} />
               </ScreenLoader>
             </div>
